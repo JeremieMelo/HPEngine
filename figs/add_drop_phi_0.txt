@@ -1,3 +1,6 @@
+ONA_1:input 1/mode 1/transmission: Abs(TE transmission) vs wavelength
+
+wavelength(nm), Abs(TE transmission)
 1560.06, 0.297216
 1560.06, 0.297131
 1560.06, 0.297046

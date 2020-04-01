@@ -126,7 +126,7 @@ def plot_md_curve(dirname="./figs"):
         data = {"x": wl, "y": t}
         batch_plot("line", data, "test", fig, ax,
                trace_color="#BF5700", xlabel="Wavelength (nm)", ylabel="Transmission", xrange=[np.min(wl), np.max(wl), 2.3], yrange=[0, 1.001, 0.2], barwidth=0.1/6, linewidth=2, fontsize=14, figsize_pixels=[400, 300], smoothness=0)
-    plt.savefig(f"{dirname}/MD.png")
+    plt.savefig(f"{dirname}/MDCurve.png")
 
 
 

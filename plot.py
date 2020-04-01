@@ -6,7 +6,7 @@ try:
     from matrix_parametrization import RealUnitaryDecomposer
 except:
     print("No unitary parametrization module found")
-from utils import (batch_plot, phase_to_voltage_cpu, set_torch_deterministic,
+from utils import (batch_plot, draw_line_plot, phase_to_voltage_cpu, set_torch_deterministic,
                    upper_triangle_to_vector_cpu, vector_to_upper_triangle_cpu,
                    voltage_quantize_fn_cpu, voltage_to_phase_cpu)
 
@@ -120,13 +120,23 @@ def plot_phase_voltage_curve(dirname="./figs"):
 def plot_md_curve(dirname="./figs"):
     fig, ax = plt.subplots()
     with open(f"{dirname}/add_drop_phi_0.txt", 'r') as f:
-        lines = f.readlines()[5000:23188]
-        lines = np.array(list(map(lambda x: x[:-1].split(", "), lines))).astype(np.float32)
-        wl, t = lines[:,0], lines[:, 1]**2
-        data = {"x": wl, "y": t}
+        lines = f.readlines()
+        length = 23188-5000
+        lines1 = np.array(list(map(lambda x: x[:-1].split(", "), lines[5000:5000+length]))).astype(np.float32)
+        lines2 = np.array(list(map(lambda x: x[:-1].split(", "), lines[5500:5500+length]))).astype(np.float32)
+        wl, t1, t2 = lines1[:,0], lines1[:, 1]**2, lines2[:, 1]**2
+        t = np.vstack([t1,t2]).transpose([1,0])
+        data = {"x": wl, "y": t1}
         batch_plot("line", data, "test", fig, ax,
-               trace_color="#BF5700", xlabel="Wavelength (nm)", ylabel="Transmission", xrange=[np.min(wl), np.max(wl), 2.3], yrange=[0, 1.001, 0.2], barwidth=0.1/6, linewidth=2, fontsize=14, figsize_pixels=[400, 300], smoothness=0)
-    plt.savefig(f"{dirname}/MDCurve.png")
+               trace_color="#2678B2", xlabel="Wavelength (nm)", ylabel="Transmission", xrange=[np.min(wl), np.max(wl), 2.3], yrange=[0, 1.001, 0.2], barwidth=0.1/6, linewidth=2, fontsize=14, figsize_pixels=[400, 300], smoothness=0)
+        # ax.plot(wl, t1, 2, "#2678B2")
+        # lines1 = np.array(list(map(lambda x: x[:-1].split(", "), lines[6000:6000+length]))).astype(np.float32)
+        # wl, t = lines1[:,0], lines1[:, 1]**2
+        data = {"x": wl, "y": t2}
+        draw_line_plot(data, ax, 2, "#BF5700")
+        # batch_plot("line", data, "test", fig, ax,
+        #        trace_color="#BF5700", xlabel="Wavelength (nm)", ylabel="Transmission", xrange=[np.min(wl), np.max(wl), 2.3], yrange=[0, 1.001, 0.2], barwidth=0.1/6, linewidth=2, fontsize=14, figsize_pixels=[400, 300], smoothness=0)
+    plt.savefig(f"{dirname}/MDCurve2.png")
 
 
 

@@ -99,39 +99,36 @@ class BestKModelSaver(object):
         self.k = k
         self.model_cache = OrderedDict()
 
-    def __insert_model_record(self, acc, dir, checkpoint_name):
+    def __insert_model_record(self, acc, dir, checkpoint_name, epoch=None):
         acc = round(acc * 100) / 100
         if(len(self.model_cache) < self.k):
-            new_checkpoint_name = "{}_acc-{:.2f}".format(checkpoint_name, acc)
+            new_checkpoint_name = f"{checkpoint_name}_acc-{acc:.2f}{'' if epoch is None else '_epoch-'+str(epoch)}"
             path = os.path.join(dir, new_checkpoint_name+".pt")
-            self.model_cache[path] = acc
+            self.model_cache[path] = (acc, epoch)
             return path, None
         else:
-            min_acc = min(list(self.model_cache.values()))
+            min_acc, min_epoch = sorted(list(self.model_cache.values()), key=lambda x: x[0])[0]
             if(acc >= min_acc + 0.01):
-                del_checkpoint_name = "{}_acc-{:.2f}".format(
-                    checkpoint_name, min_acc)
+                del_checkpoint_name = f"{checkpoint_name}_acc-{min_acc:.2f}{'' if epoch is None else '_epoch-'+str(min_epoch)}"
                 del_path = os.path.join(dir, del_checkpoint_name+".pt")
                 try:
                     del self.model_cache[del_path]
                 except:
                     print(
                         "[W] Cannot remove checkpoint: {} from cache".format(del_path))
-                new_checkpoint_name = "{}_acc-{:.2f}".format(
-                    checkpoint_name, acc)
+                new_checkpoint_name = f"{checkpoint_name}_acc-{acc:.2f}{'' if epoch is None else '_epoch-'+str(epoch)}"
                 path = os.path.join(dir, new_checkpoint_name+".pt")
-                self.model_cache[path] = acc
+                self.model_cache[path] = (acc, epoch)
                 return path, del_path
             elif(acc == min_acc):
-                new_checkpoint_name = "{}_acc-{:.2f}".format(
-                    checkpoint_name, acc)
+                new_checkpoint_name = f"{checkpoint_name}_acc-{acc:.2f}{'' if epoch is None else '_epoch-'+str(epoch)}"
                 path = os.path.join(dir, new_checkpoint_name+".pt")
-                self.model_cache[path] = acc
+                self.model_cache[path] = (acc, epoch)
                 return path, None
             else:
                 return None, None
 
-    def save_model(self, model, acc, path="./checkpoint/model.pt", print_msg=True):
+    def save_model(self, model, acc, epoch=None, path="./checkpoint/model.pt", print_msg=True):
         """Save PyTorch model in path
 
         Args:
@@ -145,7 +142,7 @@ class BestKModelSaver(object):
         if(isinstance(acc, torch.Tensor)):
             acc = acc.data.item()
         new_path, del_path = self.__insert_model_record(
-            acc, dir, checkpoint_name)
+            acc, dir, checkpoint_name, epoch)
 
         if(del_path is not None):
             try:
@@ -375,6 +372,7 @@ def set_learning_rate(lr, optimizer):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+
 def get_learning_rate(optimizer):
     return optimizer.param_groups[0]["lr"]
 
@@ -536,9 +534,45 @@ class ArgParser(object):
             print(f"[I] Arguments dumped to {file}")
 
 
+def print_stat(x):
+    if(isinstance(x, torch.Tensor)):
+        print(f"min = {x.min().data.item()}, max = {x.max().data.item()}, mean = {x.mean().data.item()}, std = {x.std().data.item()}")
+    elif(isinstance(x, np.ndarray)):
+        print(f"min = {np.min(x)}, max = {np.max(x)}, mean = {np.mean(x)}, std = {np.std(x)}")
+
+
 ##########################
 #       computation      #
 ##########################
+
+def quant_kaiming_uniform(w, nbit, beta=1.5):
+    '''https://arxiv.org/pdf/1802.04680.pdf'''
+    if(w.dim() > 2):
+        receptive_field = w[0,0,...].numel()
+    else:
+        receptive_field = 1
+    fan_in = w.size(1) * receptive_field
+    sigma = 2**(1-nbit)
+    L_min = beta * sigma
+    L = max(np.sqrt(6/fan_in), L_min)
+    return w.clone().uniform_(-L, L)
+
+
+def quant_kaiming_uniform_(w, nbit, beta=1.5):
+    '''https://arxiv.org/pdf/1802.04680.pdf'''
+    if(w.dim() > 2):
+        receptive_field = w[0,0,...].numel()
+    else:
+        receptive_field = 1
+    fan_in = w.size(1) * receptive_field
+    sigma = 2**(1-nbit)
+    L = np.sqrt(6/fan_in)
+    L_min = beta * sigma
+    scale = 2 ** round(np.log2(L_min/L))
+    scale = max(scale, 1.0)
+    L = max(L, L_min)
+
+    return torch.nn.init.uniform_(w, -L, L), scale
 
 
 def shift(v, f=1):
@@ -593,6 +627,24 @@ def get_complex_magnitude(x):
 def get_complex_energy(x):
     assert x.size(-1) == 2, "[E] Input must be complex Tensor"
     return x[..., 0] * x[..., 0] + x[..., 1] * x[..., 1]
+
+
+def im2col_2d(W, X=None, stride=1, padding=0):
+    if(X is None):
+        return W.view(W.size(0), -1), None, None, None
+    n_filters, d_filter, h_filter, w_filter = W.size()
+    n_x, d_x, h_x, w_x = X.size()
+
+    h_out = (h_x - h_filter + 2 * padding) / stride + 1
+    w_out = (w_x - w_filter + 2 * padding) / stride + 1
+
+    h_out, w_out = int(h_out), int(w_out)
+    X_col = torch.nn.functional.unfold(X.view(
+        1, -1, h_x, w_x), h_filter, dilation=1, padding=padding, stride=stride).view(n_x, -1, h_out*w_out)
+    X_col = X_col.permute(1, 2, 0).contiguous().view(X_col.size(1), -1)
+    W_col = W.view(n_filters, -1) # [out_c, in_c*kernel_size*kernel_size]
+
+    return W_col, X_col, h_out, w_out
 
 
 def check_identity_matrix(W):
@@ -2022,6 +2074,8 @@ def plotGraph(X, Y):
 
 def smooth_line(x, y, smoothness=0):
     assert 0 <= smoothness <= 1, f"[E] Only support smoothness within [0,1]"
+    if(smoothness < 1e-3):
+        return x, y
 
     N = len(x)
     N_new = int(N * (smoothness * 6 + 1))

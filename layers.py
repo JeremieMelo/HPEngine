@@ -923,6 +923,36 @@ class ModReLU(nn.Module):
         return modrelu
 
 
+
+class BiasReLU(nn.Module):
+    """ A modular ReLU activation function with bias """
+
+    def __init__(self, bias_shape, max_val=None, device=torch.device("cuda")):
+        super().__init__()
+        self.device = device
+        if(isinstance(bias_shape, int)):
+            self.bias = nn.Parameter(
+                torch.Tensor(1, bias_shape).to(self.device))
+        else:
+            self.bias = nn.Parameter(torch.Tensor(
+                1, *bias_shape).to(self.device))
+        self.max_val = max_val
+        self.relu = nn.ReLU() if max_val is None else ReLUN(max_val)
+        self.init_bias()
+
+    def init_bias(self):
+        init.constant(self.bias, val=0)
+
+    def forward(self, x):
+        """ BiasReLU forward
+        Args:
+            x (torch.tensor): A torch float tensor with the real and imaginary part
+                stored in the last dimension of the tensor; i.e. x.shape = [a, ...,b, 2]
+        """
+        x = self.relu(x + self.bias)
+        return x
+
+
 class DirectionalCoupler2X2(nn.Module):
     def __init__(self, upper_trans=np.sqrt(0.5), device=torch.device("cuda")):
         super().__init__()
@@ -1115,7 +1145,7 @@ class phase_quantize_fn_cuda(nn.Module):
 
 
 class weight_quantize_fn(nn.Module):
-    def __init__(self, w_bit, alg="qnn"):
+    def __init__(self, w_bit, alg="dorefa"):
         super(weight_quantize_fn, self).__init__()
         assert w_bit <= 32  # or w_bit == 32
         self.w_bit = w_bit
@@ -1139,7 +1169,7 @@ class weight_quantize_fn(nn.Module):
             if(self.alg == "dorefa"):
                 weight = torch.tanh(x)
                 weight = weight / 2 / torch.max(torch.abs(weight)) + 0.5
-                weight_q = 2 * self.uniform_q(weight) - 1
+                weight_q = self.uniform_q(weight)
             elif(self.alg == "qnn"):
                 x_min = torch.min(x).detach()
                 x_max = torch.max(x).detach()
@@ -1243,8 +1273,190 @@ class adder2d(nn.Module):
         return output
 
 
-class OAdder2d_Q(nn.Module):
+class OLinear_Q(nn.Module):
+    def __init__(
+        self,
+        input_channel,
+        output_channel,
+        in_bit=16,
+        w_bit=16,
+        bias=False,
+        device=torch.device("cuda:0")
+    ):
+        super().__init__()
+        self.input_channel = input_channel
+        self.output_channel = output_channel
+        self.in_bit = in_bit
+        self.w_bit = w_bit
+        self.device = device
+        self.input_quantizer = input_quantize_fn(in_bit)
+        self.weight_quantizer = weight_quantize_fn(w_bit)
+        self.weight = torch.nn.Parameter(torch.zeros(output_channel, input_channel, device=self.device))
+        self.phases = torch.cat([torch.zeros(1, 1, input_channel//2, device=self.device) - np.pi / 2, torch.zeros(1, 1, input_channel-input_channel//2, device=self.device) + np.pi / 2],dim=2)
+        self.disks = torch.ones(1, 1, input_channel, 2, device=self.device)
 
+        self.bias = bias
+
+        if bias:
+            self.b = torch.nn.Parameter(torch.zeros(output_channel, device=self.device))
+        else:
+            self.b = None
+        self.reset_parameters()
+        self.calibration = False
+        self.assigned = False
+
+    def reset_parameters(self):
+        set_torch_deterministic()
+        nn.init.kaiming_normal_(self.weight)
+        # _, self.scale = quant_kaiming_uniform_(self.weight, self.w_bit, beta=1.5)
+
+        if self.bias:
+            nn.init.uniform_(self.b)
+
+    def assign_engines(self, out_par=1, batch_par=1, phase_noise_std=0, disk_noise_std=0, deterministic=False):
+        if(phase_noise_std > 1e-4):
+            if(deterministic):
+                set_torch_deterministic()
+            self.phases = torch.cat([torch.zeros(out_par, batch_par, self.input_channel//2, device=self.device).normal_(mean=-np.pi/2, std=phase_noise_std), torch.zeros(out_par, batch_par, self.input_channel-self.input_channel//2, device=self.device).normal_(mean=np.pi/2, std=phase_noise_std)], dim=2)
+        else:
+            self.phases = torch.cat([torch.zeros(1, 1, self.input_channel//2, device=self.device) + 3 * np.pi / 2, torch.zeros(1, 1, self.input_channel-self.input_channel//2, device=self.device) + np.pi / 2],dim=2)
+        if(disk_noise_std > 1e-5):
+            if(deterministic):
+                set_torch_deterministic()
+            self.disks = 1 - torch.zeros(out_par, batch_par, self.input_channel, 2, device=self.device).normal_(mean=0, std=disk_noise_std).abs()
+        else:
+            self.disks = torch.ones(1, 1, self.input_channel, 2, device=self.device)
+        self.assigned = True
+
+    def deassign_engines(self):
+        self.phases = torch.cat([torch.zeros(1, 1, self.input_channel//2, device=self.device) + 3 * np.pi / 2, torch.zeros(1, 1, self.input_channel-self.input_channel//2, device=self.device) + np.pi / 2],dim=2)
+        self.disks = torch.ones(1, 1, self.input_channel, 2, device=self.device)
+        self.assigned = False
+
+    def static_pre_calibration(self):
+        coeff = 0.25
+        N = self.phases.size(2)
+        sin_phi = self.phases.sin()
+        self.beta0 = self.disks[...,0].sum(dim=(2)) # [out_par, image_par]
+        self.beta1 = self.disks[...,1].sum(dim=(2)) # [out_par, image_par]
+        self.beta2 = (sin_phi*(self.disks[...,0]+self.disks[...,1])/2).mean(dim=2) # [out_par, image_par]
+        self.correction_disk_0 = self.disks[...,0].mean(dim=2)
+        self.correction_disk_1 = self.disks[...,1].mean(dim=2)
+        self.correction_phi = self.beta2 / self.disks.mean(dim=(2,3))
+
+        # return self.correction # [out_par, image_par]
+
+    def enable_calibration(self):
+        self.calibration = True
+
+    def disable_calibration(self):
+        self.calibration = False
+
+    def apply_calibration(self, x):
+        # x [outc, bs]
+        x_size = x.size()
+        bs = x.size(0)
+        n_out_tile, out_tile_size = self.phases.size(0), x.size(0) // self.phases.size(0)
+        n_batch_tile, batch_tile_size = self.phases.size(1), x.size(1) // self.phases.size(1)
+        correction = self.correction.unsqueeze(1).unsqueeze(-1) # [out_par, 1, image_par, 1]
+        x = x.view(n_out_tile, out_tile_size, n_batch_tile, batch_tile_size)
+        x = x / correction
+        x = x.view(x_size)
+        return x
+
+    def tiling_matmul(self, W, X, sin_phases, disks):
+        n_out_tile, out_tile_size = sin_phases.size(0), W.size(0) // sin_phases.size(0)
+        n_batch_tile, batch_tile_size = sin_phases.size(1), X.size(1) // sin_phases.size(1)
+        W = W.unsqueeze(1) # [outc, 1, in_c]
+        W = W.view(n_out_tile, out_tile_size, 1, -1) # [n_out_tile,out_tile_size,1, in_c]
+        X = X.view(X.size(0), n_batch_tile, batch_tile_size).permute(1, 2, 0).contiguous().unsqueeze(0) # [1, n_batch_tile, batch_tile_size, inc]
+
+        factor_mul = sin_phases * (disks[...,0]+disks[...,1]) / 2
+        factor_mul = factor_mul.view(n_out_tile, n_batch_tile, -1).unsqueeze(1) # [n_out_tile,1,n_batch_tile, in_c]
+
+        # inject additive error
+        factor_add = (disks[..., 0] - disks[..., 1]) / 4
+        factor_add = factor_add.view(n_out_tile, n_batch_tile, -1).unsqueeze(1) # [n_out_tile,1,n_batch_tile, in_c]
+        additive_error = ((W * W) * factor_add).sum(dim=-1).unsqueeze(3) # [n_out_tile, out_tile_size, n_batch_tile, 1]
+        factor_add = factor_add.squeeze(1).unsqueeze(2) # [n_out_tile, n_batch_tile, 1, in_c]
+        additive_error = additive_error + ((X * X) * factor_add).sum(dim=-1).unsqueeze(1) # [n_out_tile, out_tile_size, n_batch_tile, 1]+[n_out_tile, 1, n_batch_tile, batch_tile_size]->[n_out_tile, out_tile_size, n_batch_tile, batch_tile_size]
+        additive_error = additive_error.view(self.output_channel, -1) # [outc, bs]
+
+        W = (W * factor_mul).view(self.output_channel, n_batch_tile, -1).permute(1,0,2).contiguous() # # [n_batch_tile,outc,in_c]
+        X = X.squeeze(0).permute(0,2,1).contiguous() # X [n_batch_tile, in_c, batch_tile_size]
+
+        out = W.bmm(X).transpose(0,1).contiguous().view(self.output_channel, -1) # [outc, bs]
+        out = out + additive_error
+
+        return out
+
+    def tiling_matmul_with_calibration(self, W, X, sin_phases, disks):
+        n_out_tile, out_tile_size = sin_phases.size(0), W.size(0) // sin_phases.size(0)
+        n_batch_tile, batch_tile_size = sin_phases.size(1), X.size(1) // sin_phases.size(1)
+        disks = self.disks.view(n_out_tile, n_batch_tile, -1 , 2).unsqueeze(1) # [n_out_tile, 1, n_batch_tile, inc, 2]
+        W = W.unsqueeze(1) # [outc, 1, in_c]
+        W = W.view(n_out_tile, out_tile_size, 1, -1) # [n_out_tile,out_tile_size,1, in_c]
+        # W_sq = (W * W).unsqueeze(-1) # [n_out_tile,out_tile_size,1, in_c, 1]
+        W_sq_sum = ((W * W).unsqueeze(-1)*disks).sum(dim=-2).unsqueeze(3) # [n_out_tile, out_tile_size, n_batch_tile, 1, 2] for two rails
+
+        X = X.view(X.size(0), n_batch_tile, batch_tile_size).permute(1, 2, 0).contiguous().unsqueeze(0) # [1, n_batch_tile, batch_tile_size, inc]
+        # X_sq = (X * X).unsqueeze(-1)
+        # disks = disks.transpose(1,2).contiguous() # [n_out_tile, n_batch_tile, 1, inc, 2]
+        X_sq_sum = ((X * X).unsqueeze(-1) * disks.transpose(1,2).contiguous()).sum(dim=-2).unsqueeze(1) # [n_out_tile,1, n_batch_tile, batch_tile_size, 2]
+
+        factor_mul = sin_phases.unsqueeze(-1) * self.disks
+        factor_mul = factor_mul.view(n_out_tile, n_batch_tile, -1, 2).unsqueeze(1) # [n_out_tile,1,n_batch_tile, in_c, 2]
+
+        W = (W.unsqueeze(-1) * factor_mul).view(self.output_channel, n_batch_tile, -1, 2).permute(1,0,2,3).contiguous() # # [n_batch_tile,outc,in_c, 2]
+        X = X.squeeze(0).permute(0,2,1).contiguous() # X [n_batch_tile, in_c, batch_tile_size]
+        two_X_W_sin_phi_alpha_0 = 2*W[...,0].bmm(X).view(n_batch_tile, n_out_tile, out_tile_size, batch_tile_size).permute(1,2,0,3).contiguous()
+        two_X_W_sin_phi_alpha_1 = 2*W[...,1].bmm(X).view(n_batch_tile, n_out_tile, out_tile_size, batch_tile_size).permute(1,2,0,3).contiguous() #  [n_out_tile, out_tile_size, n_batch_tile, batch_tile_size]
+        W_sq_plus_X_sq_sum = W_sq_sum + X_sq_sum # [n_out_tile, out_tile_size, n_batch_tile, batch_tile_size, 2]
+        rail_0 = (W_sq_plus_X_sq_sum[..., 0] + two_X_W_sin_phi_alpha_0) / (4 * self.correction_disk_0.unsqueeze(1).unsqueeze(-1))
+        rail_1 = (W_sq_plus_X_sq_sum[..., 1] - two_X_W_sin_phi_alpha_1) / (4 * self.correction_disk_1.unsqueeze(1).unsqueeze(-1))
+        # print(rail_0.size(), rail_1.size())
+        out = (rail_0 - rail_1) / self.correction_phi.unsqueeze(1).unsqueeze(-1)
+        out = out.view(self.output_channel, -1)
+
+        return out
+
+    def func(self, X, W):
+        if(self.assigned == False):
+            ## half kernels are negative
+            W = torch.cat([-W[..., :self.input_channel//2], W[..., self.input_channel//2:]], dim=1)
+            return F.linear(X, W, bias=None)
+        n_x = X.size(0)
+        X_col = X.permute(1,0).contiguous() # [inc, bs]
+
+        # matmul with phase consideration
+        # out = W.matmul(X_col)
+        if(self.calibration):
+            out = self.tiling_matmul_with_calibration(W, X_col, self.phases.sin(), self.disks)
+        else:
+            out = self.tiling_matmul(W, X_col, self.phases.sin(), self.disks)
+        # print(1, F.mse_loss(real, out).data.item())
+        # print("real:", real[0,100])
+        # print("noisy:", out[0,100])
+        # [outc, h*w*bs]
+
+        # print("calib:", out[0,100])
+        # print(2, F.mse_loss(real, out).data.item())
+        out = out.permute(1, 0).contiguous()
+        return out
+
+    def forward(self, x):
+        x = self.input_quantizer(x)
+        weight = self.weight_quantizer(self.weight)
+
+        output = self.func(x, weight)
+
+        if self.bias:
+            output += self.b.unsqueeze(0)
+        # output = output / weight.norm(p=2, dim=1) / 1.21
+        return output
+
+
+class OAdder2d_Q(nn.Module):
     def __init__(
         self,
         input_channel,
@@ -1254,7 +1466,6 @@ class OAdder2d_Q(nn.Module):
         padding=0,
         in_bit=16,
         w_bit=16,
-        phase_noise_std=0,
         mode="oconv",
         bias=False,
         device=torch.device("cuda:0")
@@ -1267,16 +1478,13 @@ class OAdder2d_Q(nn.Module):
         self.kernel_size = kernel_size
         self.in_bit = in_bit
         self.w_bit = w_bit
-        self.phase_noise_std = phase_noise_std
         self.mode = mode
         self.device = device
         self.input_quantizer = input_quantize_fn(in_bit)
         self.weight_quantizer = weight_quantize_fn(w_bit)
         self.weight = torch.nn.Parameter(torch.zeros(output_channel, input_channel, kernel_size, kernel_size, device=self.device))
-        if(self.phase_noise_std > 1e-5):
-            self.phases = torch.zeros(1, input_channel, kernel_size, kernel_size, device=self.device).normal_(mean=np.pi/2, std=self.phase_noise_std)
-        else:
-            self.phases = torch.zeros(1, input_channel, kernel_size, kernel_size, device=self.device) + np.pi / 2
+        self.phases = torch.cat([torch.zeros(1, 1, input_channel//2, kernel_size, kernel_size, device=self.device) - np.pi / 2, torch.zeros(1, 1, input_channel-input_channel//2, kernel_size, kernel_size, device=self.device) + np.pi / 2],dim=2)
+        self.disks = torch.ones(1, 1, input_channel, kernel_size, kernel_size, 2, device=self.device)
 
         self.bias = bias
 
@@ -1288,12 +1496,136 @@ class OAdder2d_Q(nn.Module):
                            "oadder": self.optical_adder2d_function,
                            "oconv": self.optical_conv2d_function}[mode]
         self.reset_parameters()
+        self.calibration = False
+        self.assigned = False
 
     def reset_parameters(self):
         set_torch_deterministic()
         nn.init.kaiming_normal_(self.weight)
+        # _, self.scale = quant_kaiming_uniform_(self.weight, self.w_bit, beta=1.5)
         if self.bias:
             nn.init.uniform_(self.b)
+
+    def assign_engines(self, out_par=1, image_par=1, phase_noise_std=0, disk_noise_std=0, deterministic=False):
+        if(phase_noise_std > 1e-4):
+            if(deterministic):
+                set_torch_deterministic()
+            self.phases = torch.cat([torch.zeros(out_par, image_par, self.input_channel//2, self.kernel_size, self.kernel_size, device=self.device).normal_(mean=-np.pi/2, std=phase_noise_std), torch.zeros(out_par, image_par, self.input_channel-self.input_channel//2, self.kernel_size, self.kernel_size, device=self.device).normal_(mean=np.pi/2, std=phase_noise_std)], dim=2)
+        else:
+            self.phases = torch.cat([torch.zeros(1, 1, self.input_channel//2, self.kernel_size, self.kernel_size, device=self.device) + 3 * np.pi / 2, torch.zeros(1, 1, self.input_channel-self.input_channel//2, self.kernel_size, self.kernel_size, device=self.device) + np.pi / 2],dim=2)
+        if(disk_noise_std > 1e-5):
+            if(deterministic):
+                set_torch_deterministic()
+            self.disks = 1 - torch.zeros(out_par, image_par, self.input_channel, self.kernel_size, self.kernel_size, 2, device=self.device).normal_(mean=0, std=disk_noise_std).abs()
+        else:
+            self.disks = torch.ones(1, 1, self.input_channel, self.kernel_size, self.kernel_size, 2, device=self.device)
+        self.assigned = True
+
+    def deassign_engines(self):
+        self.phases = torch.cat([torch.zeros(1, 1, input_channel//2, kernel_size, kernel_size, device=self.device) + 3 * np.pi / 2, torch.zeros(1, 1, input_channel-input_channel//2, kernel_size, kernel_size, device=self.device) + np.pi / 2],dim=2)
+        self.disks = torch.ones(1, 1, self.input_channel, self.kernel_size, self.kernel_size, 2, device=self.device)
+        self.assigned = False
+
+    def static_pre_calibration(self):
+        coeff = 0.25
+        N = self.phases.size(2)*self.phases.size(3)*self.phases.size(4)
+        sin_phi = self.phases.sin()
+        self.beta0 = self.disks[...,0].sum(dim=(2,3,4)) # [out_par, image_par]
+        self.beta1 = self.disks[...,1].sum(dim=(2,3,4)) # [out_par, image_par]
+        self.beta2 = (sin_phi*(self.disks[...,0]+self.disks[...,1])/2).mean(dim=(2,3,4)) # [out_par, image_par]
+        if(self.mode == "oadder"):
+            self.correction = 2 * N * coeff * (1 - self.beta2)
+        elif(self.mode == "oconv"):
+            self.correction_disk_0 = self.disks[...,0].mean(dim=(2,3,4))
+            self.correction_disk_1 = self.disks[...,1].mean(dim=(2,3,4))
+            self.correction_phi = self.beta2 / self.disks.mean(dim=(2,3,4,5))
+        else:
+            raise NotImplementedError
+        # return self.correction # [out_par, image_par]
+
+    def enable_calibration(self):
+        self.calibration = True
+
+    def disable_calibration(self):
+        self.calibration = False
+
+    def apply_calibration(self, x):
+        # x [outc, h*w*bs]
+
+        x_size = x.size()
+        bs = x.size(0)
+        n_out_tile, out_tile_size = self.phases.size(0), x.size(0) // self.phases.size(0)
+        n_image_tile, image_tile_size = self.phases.size(1), x.size(1) // self.phases.size(1)
+        # correction = self.correction.unsqueeze(1).unsqueeze(-1) # [out_par, 1, image_par, 1]
+        x = x.view(n_out_tile, out_tile_size, n_image_tile, image_tile_size)
+        if(self.mode == "oconv"):
+            correction_disk_0 = self.correction_disk_0.unsqueeze(1).unsqueeze(-1) # [out_par, 1, image_par, 1]
+            correction_disk_1 = self.correction_disk_1.unsqueeze(1).unsqueeze(-1) # [out_par, 1, image_par, 1]
+            correction_phi = self.correction_phi.unsqueeze(1).unsqueeze(-1) # [out_par, 1, image_par, 1]
+
+        elif(self.mode == "oadder"):
+            x = x + correction
+        else:
+            raise NotImplementedError
+        x = x.view(x_size)
+        return x
+
+    def tiling_matmul(self, W, X, sin_phases, disks):
+        n_out_tile, out_tile_size = sin_phases.size(0), W.size(0) // sin_phases.size(0)
+        n_image_tile, image_tile_size = sin_phases.size(1), X.size(1) // sin_phases.size(1)
+        W = W.unsqueeze(1) # [outc, 1, in_c*kernel_size*kernel_size]
+        W = W.view(n_out_tile, out_tile_size, 1, -1) # [n_out_tile,out_tile_size,1, in_c*kernel_size*kernel_size]
+        X = X.view(X.size(0), n_image_tile, image_tile_size).permute(1, 2, 0).contiguous().unsqueeze(0) # [1, n_image_tile, image_tile_size, inc*kernel_size*kernel_size]
+
+        factor_mul = sin_phases * (disks[...,0]+disks[...,1]) / 2
+        factor_mul = factor_mul.view(n_out_tile, n_image_tile, -1).unsqueeze(1) # [n_out_tile,1,n_image_tile, in_c*kernel_size*kernel_size]
+
+        # inject additive error
+        factor_add = (disks[..., 0] - disks[..., 1]) / 4
+        factor_add = factor_add.view(n_out_tile, n_image_tile, -1).unsqueeze(1) # [n_out_tile,1,n_image_tile, in_c*kernel_size*kernel_size]
+        additive_error = ((W * W) * factor_add).sum(dim=-1).unsqueeze(3) # [n_out_tile, out_tile_size, n_image_tile, 1]
+        factor_add = factor_add.squeeze(1).unsqueeze(2) # [n_out_tile, n_image_tile, 1, in_c*kernel_size*kernel_size]
+        additive_error = additive_error + ((X * X) * factor_add).sum(dim=-1).unsqueeze(1) # [n_out_tile, out_tile_size, n_image_tile, 1]+[n_out_tile, 1, n_image_tile, image_tile_size]->[n_out_tile, out_tile_size, n_image_tile, image_tile_size]
+        additive_error = additive_error.view(self.output_channel, -1) # [outc, h*w*bs]
+
+        W = (W * factor_mul).view(self.output_channel, n_image_tile, -1).permute(1,0,2).contiguous() # # [n_image_tile,outc,in_c*kernel_size*kernel_size]
+        X = X.squeeze(0).permute(0,2,1).contiguous() # X [n_image_tile, in_c*kernel_size*kernel_size, image_tile_size]
+
+        out = W.bmm(X).transpose(0,1).contiguous().view(self.output_channel, -1) # [outc, h*w*bs]
+        out = out + additive_error
+        return out
+
+
+    def tiling_matmul_with_oconv_calibration(self, W, X, sin_phases, disks):
+        n_out_tile, out_tile_size = sin_phases.size(0), W.size(0) // sin_phases.size(0)
+        n_image_tile, image_tile_size = sin_phases.size(1), X.size(1) // sin_phases.size(1)
+        disks = self.disks.view(n_out_tile, n_image_tile, -1 , 2).unsqueeze(1) # [n_out_tile, 1, n_image_tile, inc*ks*ks, 2]
+        W = W.unsqueeze(1) # [outc, 1, in_c*kernel_size*kernel_size]
+        W = W.view(n_out_tile, out_tile_size, 1, -1) # [n_out_tile,out_tile_size,1, in_c*kernel_size*kernel_size]
+        # W_sq = (W * W).unsqueeze(-1) # [n_out_tile,out_tile_size,1, in_c*kernel_size*kernel_size, 1]
+        W_sq_sum = ((W * W).unsqueeze(-1)*disks).sum(dim=-2).unsqueeze(3) # [n_out_tile, out_tile_size, n_image_tile, 1, 2] for two rails
+
+
+        X = X.view(X.size(0), n_image_tile, image_tile_size).permute(1, 2, 0).contiguous().unsqueeze(0) # [1, n_image_tile, image_tile_size, inc*kernel_size*kernel_size]
+        # X_sq = (X * X).unsqueeze(-1)
+        # disks = disks.transpose(1,2).contiguous() # [n_out_tile, n_image_tile, 1, inc*ks*ks, 2]
+        X_sq_sum = ((X * X).unsqueeze(-1) * disks.transpose(1,2).contiguous()).sum(dim=-2).unsqueeze(1) # [n_out_tile,1, n_image_tile, image_tile_size, 2]
+
+        factor_mul = sin_phases.unsqueeze(-1) * self.disks
+        factor_mul = factor_mul.view(n_out_tile, n_image_tile, -1, 2).unsqueeze(1) # [n_out_tile,1,n_image_tile, in_c*kernel_size*kernel_size, 2]
+
+        W = (W.unsqueeze(-1) * factor_mul).view(self.output_channel, n_image_tile, -1, 2).permute(1,0,2,3).contiguous() # # [n_image_tile,outc,in_c*kernel_size*kernel_size, 2]
+        X = X.squeeze(0).permute(0,2,1).contiguous() # X [n_image_tile, in_c*kernel_size*kernel_size, image_tile_size]
+        two_X_W_sin_phi_alpha_0 = 2*W[...,0].bmm(X).view(n_image_tile, n_out_tile, out_tile_size, image_tile_size).permute(1,2,0,3).contiguous()
+        two_X_W_sin_phi_alpha_1 = 2*W[...,1].bmm(X).view(n_image_tile, n_out_tile, out_tile_size, image_tile_size).permute(1,2,0,3).contiguous() #  [n_out_tile, out_tile_size, n_image_tile, image_tile_size]
+        W_sq_plus_X_sq_sum = W_sq_sum + X_sq_sum # [n_out_tile, out_tile_size, n_image_tile, image_tile_size, 2]
+        rail_0 = (W_sq_plus_X_sq_sum[..., 0] + two_X_W_sin_phi_alpha_0) / (4 * self.correction_disk_0.unsqueeze(1).unsqueeze(-1))
+        rail_1 = (W_sq_plus_X_sq_sum[..., 1] - two_X_W_sin_phi_alpha_1) / (4 * self.correction_disk_1.unsqueeze(1).unsqueeze(-1))
+        # print(rail_0.size(), rail_1.size())
+        out = (rail_0 - rail_1) / self.correction_phi.unsqueeze(1).unsqueeze(-1)
+        out = out.view(self.output_channel, -1)
+
+        return out
 
     def adder2d_function(self, X, W, stride=1, padding=0):
         n_filters, d_filter, h_filter, w_filter = W.size()
@@ -1333,26 +1665,88 @@ class OAdder2d_Q(nn.Module):
         W_by_X_by_sin_phi = -2*(W_col * self.phases.sin().view(1, -1).data).matmul(X_col) # [outc, inc*kernel_size*kernel_size] * [1, inc*kernel_size*kernel_size] @ [inc*ks*ks, ...] = [outc, ...]
         out = -(W_col_sq + X_col_sq + W_by_X_by_sin_phi)
 
+        out = out.view(n_filters, h_out, w_out, n_x)
+        out = out.permute(3, 0, 1, 2).contiguous()
+        if(self.calibration):
+            # [bs, outc, h, w]
+            out = self.apply_calibration(out)
 
+        return out
+
+    def optical_conv2d_function(self, X, W, stride=1, padding=0):
+        if(self.assigned == False):
+            ## half kernels are negative
+            W = torch.cat([-W[:, 0:self.input_channel//2,...], W[:, self.input_channel//2:,...]], dim=1)
+            return F.conv2d(X, W, stride=stride, padding=padding)
+        n_x = X.size(0)
+        n_filters, d_filter, h_filter, w_filter = W.size()
+        W_col, X_col, h_out, w_out = im2col_2d(W, X, stride, padding)
+        # matmul with phase consideration
+        # real = W_col.matmul(X_col)
+        if(self.calibration):
+            out = self.tiling_matmul_with_oconv_calibration(W_col, X_col, self.phases.sin(), self.disks)
+        else:
+            out = self.tiling_matmul(W_col, X_col, self.phases.sin(), self.disks)
+        # print(1, F.mse_loss(real, out).data.item())
+        # print("real:", real[0,100])
+        # print("noisy:", out[0,100])
+        # [outc, h*w*bs]
+
+        # print("calib:", out[0,100])
+        # print(2, F.mse_loss(real, out).data.item())
         out = out.view(n_filters, h_out, w_out, n_x)
         out = out.permute(3, 0, 1, 2).contiguous()
 
         return out
 
-    def optical_conv2d_function(self, X, W, stride=1, padding=0):
-
-        out = F.conv2d(X, W * self.phases.sin(), bias=None, stride=stride, padding=padding)
-        return out
-
     def forward(self, x):
+        # if(self.mode=="oadder" and self.w_bit == 1):
+        #     x_mean = x.data.mean(dim=1, keepdim=True)**2 # [bs, 1, h, w]
+        #     w_mean = self.weight.data.mean(dim=[1,2,3]).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)**2 # [1, outc, 1, 1]
+        #     coeff = x_mean * w_mean
+        # print(x.mean().data.item(), x.std().data.item(), x.max().data.item())
         x = self.input_quantizer(x)
         weight = self.weight_quantizer(self.weight)
 
         output = self.adder_func(x, weight, self.stride, self.padding)
+        # if(self.mode=="oadder" and self.w_bit == 1):
+        #     x = x * coeff
+        # output[self.output_channel // 2:] = output[self.output_channel // 2:] * -1
+
         if self.bias:
             output += self.b.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        # factor = weight.view(self.output_channel, -1).norm(p=2, dim=1).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        # output = output / factor / 1.21
+
 
         return output
+
+class NormProp(nn.Module):
+    def __init__(self, out_channels, act):
+        super().__init__()
+        self.mul = 1/np.sqrt(0.5*(1-1/np.pi))
+        self.add = np.sqrt(1/2*np.pi)
+        self.act = act
+        self.out_channels = out_channels
+        self.gamma = nn.Parameter(torch.zeros(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+        nn.init.constant_(self.gamma, 1/1.21)
+        nn.init.constant_(self.beta, 0)
+
+
+    def forward(self, x, w):
+        if(w.dim() == 2):
+            w = w.view(w.size(0), -1).norm(p=2, dim=1).data
+            gamma = self.gamma.unsqueeze(0)
+            beta = self.beta.unsqueeze(0)
+        else:
+            w = w.view(w.size(0), -1).norm(p=2, dim=1).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).data
+            gamma = self.gamma.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            beta = self.beta.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        x = self.mul*(self.act(gamma * x / w + beta) - self.add)
+        return x
+
+
 
 
 if __name__ == "__main__":
@@ -1367,12 +1761,55 @@ if __name__ == "__main__":
     # print(model1(x)/avg_sin_phase)
     # print(model2(x))
     set_torch_deterministic()
-    model1 = OAdder2d_Q(2,2,3,device=device,mode="oadder", phase_noise_std=0.1)
-    set_torch_deterministic()
-    model2 = OAdder2d_Q(2,2,3,device=device,mode="oadder")
+    model = OAdder2d_Q(2,
+                        2,
+                        3,
+                        stride=1,
+                        padding=0,
+                        in_bit=8,
+                        w_bit=8,
+                        mode="oconv",
+                        bias=False,
+                        device=device
+                    )
     x = torch.ones(2, 2, 4, 4, device=device)
-    print(model1(x))
-    print(model2(x))
+    y = model(x)
 
-    exit(0)
+    model.assign_engines(2,2,0,0,True)
+
+    # model.enable_calibration()
+    # model.static_pre_calibration()
+    # y1 = model(x)
+    model.disable_calibration()
+    y2 = model(x)
+    print(y)
+    # print(y1)
+    print(y2)
+    # print(F.mse_loss(y,y1).data.item())
+    print(F.mse_loss(y,y2).data.item())
+
+    set_torch_deterministic()
+    model = OLinear_Q(8,
+                    8,
+                    in_bit=8,
+                    w_bit=8,
+                    bias=False,
+                    device=device
+                    )
+    x = torch.ones(4, 8, device=device)
+    y = model(x)
+
+    model.assign_engines(2,2,0.1,0.05,True)
+    # model.deassign_engines()
+    # model.enable_calibration()
+    # model.static_pre_calibration()
+    # y1 = model(x)
+    model.disable_calibration()
+    y2 = model(x)
+    print(y)
+    # print(y1)
+    print(y2)
+    # print(F.mse_loss(y,y1).data.item())
+    print(F.mse_loss(y,y2).data.item())
+
 

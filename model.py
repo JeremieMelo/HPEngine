@@ -15,7 +15,10 @@ import torch.nn.functional as F
 from torch.autograd import grad
 
 from layers import *
-from matrix_parametrization import *
+try:
+    from matrix_parametrization import *
+except:
+    print("No unitary parametrization module found")
 from utils import *
 
 
@@ -2899,6 +2902,476 @@ class FCMLP_Tiny(nn.Module):
         x = torch.relu(self.fc1(x))
         # x = torch.sigmoid(self.fc2(x))
         return F.log_softmax(self.fc2(x), dim=1)
+
+
+
+class HP_CLASS_CNN(nn.Module):
+    def __init__(self, img_height, img_width, in_channels, n_class, kernel_list=[16], hidden_list=[32], pool_out_size=5, in_bits=32, w_bits=32, act="relu", act_thres=6, mode="oconv", device=torch.device("cuda")):
+        super().__init__()
+        self.img_height = img_height
+        self.img_width = img_width
+        self.in_channels = in_channels
+        self.n_class = n_class
+        self.kernel_list = kernel_list
+        self.hidden_list = hidden_list
+        self.pool_out_size = pool_out_size
+        self.in_bits = in_bits
+        self.w_bits = w_bits
+        self.act = act
+        self.act_thres = act_thres
+        self.mode = mode
+        self.device = device
+        self.build_layers()
+        self.reset_parameters()
+
+    def build_layers(self):
+        self.conv_layers = OrderedDict()
+        self.bn_layers = OrderedDict()
+        self.fc_layers = OrderedDict()
+        self.acts = OrderedDict()
+        for idx, out_channels in enumerate(self.kernel_list, 0):
+            layer_name = "conv" + str(idx+1)
+            bn_name = "bn" + str(idx+1)
+            act_name = "conv_act" + str(idx+1)
+            in_channels = self.in_channels if(
+                idx == 0) else self.kernel_list[idx-1]
+            conv = OAdder2d_Q(in_channels,
+                            out_channels,
+                            3,
+                            stride=1,
+                            padding=1,
+                            in_bit=self.in_bits,
+                            w_bit=self.w_bits,
+                            mode=self.mode,
+                            bias=False,
+                            device=self.device)
+
+            bn = nn.BatchNorm2d(out_channels)
+            # activation = BiasReLU(bias_shape=(out_channels, 1, 1),
+            #                       max_val=self.act_thres,
+            #                       device=self.device)
+            # activation = ReLUN(self.act_thres, inplace=True)
+            if(self.act == "relu"):
+                activation = nn.ReLU(inplace=True)
+            elif(self.act == "relun"):
+                activation = ReLUN(self.act_thres, inplace=True)
+            elif(self.act == "tanh"):
+                activation = nn.Tanh()
+            else:
+                activation = nn.Identity()
+
+            self.conv_layers[layer_name] = conv
+            self.bn_layers[layer_name] = bn
+            self.acts[layer_name] = activation
+            super().__setattr__(layer_name, conv)
+            super().__setattr__(bn_name, bn)
+            super().__setattr__(act_name, activation)
+
+        self.pool2d = nn.AdaptiveAvgPool2d(self.pool_out_size)
+
+        for idx, hidden_dim in enumerate(self.hidden_list, 0):
+            layer_name = "fc" + str(idx+1)
+            act_name = "fc_act" + str(idx+1)
+            in_channel = self.kernel_list[-1]*self.pool_out_size * \
+                self.pool_out_size if idx == 0 else self.hidden_list[idx-1]
+            out_channel = hidden_dim
+            fc = nn.Linear(in_channel, out_channel, bias=False)
+            activation = nn.ReLU()
+            self.fc_layers[layer_name] = fc
+            self.acts[layer_name] = activation
+            super().__setattr__(layer_name, fc)
+            super().__setattr__(act_name, activation)
+
+        layer_name = "fc"+str(len(self.hidden_list)+1)
+        fc = nn.Linear(self.hidden_list[-1], self.n_class, bias=False)
+        super().__setattr__(layer_name, fc)
+        self.fc_layers[layer_name] = fc
+        # self.reg = nn.ModuleList(
+        #     list(self.conv_layers.values()) + list(self.fc_layers.values()))
+
+    def reset_parameters(self, initializer=nn.init.kaiming_normal_):
+        # for layer in self.conv_layers:
+        #     # print(self.layers[layer])
+        #     self.conv_layers[layer].reset_parameters()
+        for layer in self.fc_layers:
+            nn.init.kaiming_normal_(self.fc_layers[layer].weight)
+
+    def enable_calibration(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].enable_calibration()
+
+    def disable_calibration(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].disable_calibration()
+
+    def static_pre_calibration(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].static_pre_calibration()
+
+    def assign_engines(self, out_par=1, image_par=1, phase_noise_std=0, disk_noise_std=0, deterministic=False):
+        self.phase_noise_std = phase_noise_std
+        self.disk_noise_std = disk_noise_std
+        for layer in self.conv_layers:
+            self.conv_layers[layer].assign_engines(out_par, image_par, phase_noise_std, disk_noise_std, deterministic)
+
+    def deassign_engines(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].deassign_engines()
+
+    def forward(self, x):
+        for idx, layer in enumerate(self.conv_layers, 1):
+            x = self.conv_layers[layer](x)
+            # if(idx == 2):
+            #     print("conv")
+            #     print_stat(x)
+            x = self.bn_layers[layer](x)
+            # if(idx == 2):
+            #     print("bn")
+            #     print_stat(x)
+            x = self.acts[layer](x)
+        n_fc = len(self.fc_layers)
+
+        x = self.pool2d(x)
+
+        x = x.contiguous().view(-1, x.size(1)*x.size(2)*x.size(3))
+
+        for idx, layer in enumerate(self.fc_layers, 1):
+
+            x = self.fc_layers[layer](x)
+
+            if(idx < n_fc):
+                x = self.acts[layer](x)
+
+        out = F.log_softmax(x, dim=1)
+        return out
+
+
+
+class HP_CLASS_CNN2(nn.Module):
+    def __init__(self, img_height, img_width, in_channels, n_class, kernel_list=[16], hidden_list=[32], pool_out_size=5, in_bits=32, w_bits=32, act="relu", act_thres=6, mode="oconv", device=torch.device("cuda")):
+        super().__init__()
+        self.img_height = img_height
+        self.img_width = img_width
+        self.in_channels = in_channels
+        self.n_class = n_class
+        self.kernel_list = kernel_list
+        self.hidden_list = hidden_list
+        self.pool_out_size = pool_out_size
+        self.in_bits = in_bits
+        self.w_bits = w_bits
+        self.act = act
+        self.act_thres = act_thres
+        self.mode = mode
+        self.device = device
+        self.build_layers()
+        self.reset_parameters()
+
+    def build_layers(self):
+        self.conv_layers = OrderedDict()
+        self.bn_layers = OrderedDict()
+        self.fc_layers = OrderedDict()
+        self.acts = OrderedDict()
+        for idx, out_channels in enumerate(self.kernel_list, 0):
+            layer_name = "conv" + str(idx+1)
+            bn_name = "bn" + str(idx+1)
+            act_name = "conv_act" + str(idx+1)
+            in_channels = self.in_channels if(
+                idx == 0) else self.kernel_list[idx-1]
+            conv = OAdder2d_Q(in_channels,
+                            out_channels,
+                            3,
+                            stride=1,
+                            padding=1,
+                            in_bit=self.in_bits,
+                            w_bit=self.w_bits,
+                            mode=self.mode,
+                            bias=False,
+                            device=self.device)
+
+            bn =  nn.BatchNorm2d(out_channels)
+            # activation = BiasReLU(bias_shape=(out_channels, 1, 1),
+            #                       max_val=self.act_thres,
+            #                       device=self.device)
+            # activation = ReLUN(self.act_thres, inplace=True)
+            if(self.act == "relu"):
+                activation = nn.ReLU(inplace=True)
+            elif(self.act == "relun"):
+                activation = ReLUN(self.act_thres, inplace=True)
+            elif(self.act == "tanh"):
+                activation = nn.Tanh()
+            else:
+                activation = nn.Identity()
+
+            self.conv_layers[layer_name] = conv
+            self.bn_layers[layer_name] = bn
+            self.acts[layer_name] = activation
+            super().__setattr__(layer_name, conv)
+            super().__setattr__(bn_name, bn)
+            super().__setattr__(act_name, activation)
+
+        self.pool2d = nn.AdaptiveAvgPool2d(self.pool_out_size)
+
+        for idx, hidden_dim in enumerate(self.hidden_list, 0):
+            layer_name = "fc" + str(idx+1)
+            act_name = "fc_act" + str(idx+1)
+            in_channel = self.kernel_list[-1]*self.pool_out_size * \
+                self.pool_out_size if idx == 0 else self.hidden_list[idx-1]
+            out_channel = hidden_dim
+            # fc = nn.Linear(in_channel, out_channel, bias=False)
+            fc = OLinear_Q(in_channel, out_channel, self.in_bits, self.w_bits, False, self.device)
+            if(self.act == "relu"):
+                activation = nn.ReLU(inplace=True)
+            elif(self.act == "relun"):
+                activation = ReLUN(self.act_thres, inplace=True)
+            elif(self.act == "tanh"):
+                activation = nn.Tanh()
+            else:
+                activation = nn.Identity()
+            self.fc_layers[layer_name] = fc
+            self.acts[layer_name] = activation
+            super().__setattr__(layer_name, fc)
+            super().__setattr__(act_name, activation)
+
+        layer_name = "fc"+str(len(self.hidden_list)+1)
+        fc = OLinear_Q(self.hidden_list[-1], self.n_class, self.in_bits, self.w_bits, False, self.device)
+
+        # fc = nn.Linear(self.hidden_list[-1], self.n_class, bias=False)
+        super().__setattr__(layer_name, fc)
+        self.fc_layers[layer_name] = fc
+        # self.reg = nn.ModuleList(
+        #     list(self.conv_layers.values()) + list(self.fc_layers.values()))
+
+    def reset_parameters(self, initializer=nn.init.kaiming_normal_):
+        # for layer in self.conv_layers:
+        #     # print(self.layers[layer])
+        #     self.conv_layers[layer].reset_parameters()
+        # for layer in self.fc_layers:
+        #     nn.init.kaiming_normal_(self.fc_layers[layer].weight)
+        pass
+
+    def enable_calibration(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].enable_calibration()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].enable_calibration()
+
+    def disable_calibration(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].disable_calibration()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].disable_calibration()
+
+    def static_pre_calibration(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].static_pre_calibration()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].static_pre_calibration()
+
+    def assign_engines(self, out_par=1, image_par=1, phase_noise_std=0, disk_noise_std=0, deterministic=False):
+        self.phase_noise_std = phase_noise_std
+        self.disk_noise_std = disk_noise_std
+        for layer in self.fc_layers:
+            self.fc_layers[layer].assign_engines(out_par, image_par, phase_noise_std, disk_noise_std, deterministic)
+        for layer in self.conv_layers:
+            self.conv_layers[layer].assign_engines(out_par, image_par, phase_noise_std, disk_noise_std, deterministic)
+
+    def deassign_engines(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].deassign_engines()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].deassign_engines()
+
+    def forward(self, x):
+        for idx, layer in enumerate(self.conv_layers, 1):
+            x = self.conv_layers[layer](x)
+            # if(idx == 2):
+            #     print("conv")
+            #     print_stat(x)
+            x = self.bn_layers[layer](x)
+            # if(idx == 2):
+            #     print("bn")
+            #     print_stat(x)
+            x = self.acts[layer](x)
+        n_fc = len(self.fc_layers)
+
+        x = self.pool2d(x)
+
+        x = x.contiguous().view(-1, x.size(1)*x.size(2)*x.size(3))
+
+        for idx, layer in enumerate(self.fc_layers, 1):
+
+            x = self.fc_layers[layer](x)
+
+            if(idx < n_fc):
+                x = self.acts[layer](x)
+
+        out = F.log_softmax(x, dim=1)
+        return out
+
+
+
+class HP_CLASS_CNN3(nn.Module):
+    def __init__(self, img_height, img_width, in_channels, n_class, kernel_list=[16], hidden_list=[32], pool_out_size=5, in_bits=32, w_bits=32, act="relu", act_thres=6, mode="oconv", device=torch.device("cuda")):
+        super().__init__()
+        self.img_height = img_height
+        self.img_width = img_width
+        self.in_channels = in_channels
+        self.n_class = n_class
+        self.kernel_list = kernel_list
+        self.hidden_list = hidden_list
+        self.pool_out_size = pool_out_size
+        self.in_bits = in_bits
+        self.w_bits = w_bits
+        self.act = act
+        self.act_thres = act_thres
+        self.mode = mode
+        self.device = device
+        self.build_layers()
+        self.reset_parameters()
+
+    def build_layers(self):
+        self.conv_layers = OrderedDict()
+        self.bn_layers = OrderedDict()
+        self.fc_layers = OrderedDict()
+        self.acts = OrderedDict()
+        for idx, out_channels in enumerate(self.kernel_list, 0):
+            layer_name = "conv" + str(idx+1)
+            bn_name = "bn" + str(idx+1)
+            act_name = "conv_act" + str(idx+1)
+            in_channels = self.in_channels if(
+                idx == 0) else self.kernel_list[idx-1]
+            conv = OAdder2d_Q(in_channels,
+                            out_channels,
+                            3,
+                            stride=1,
+                            padding=1,
+                            in_bit=self.in_bits,
+                            w_bit=self.w_bits,
+                            mode=self.mode,
+                            bias=False,
+                            device=self.device)
+
+            bn = nn.Identity()
+            # activation = BiasReLU(bias_shape=(out_channels, 1, 1),
+            #                       max_val=self.act_thres,
+            #                       device=self.device)
+            # activation = ReLUN(self.act_thres, inplace=True)
+            if(self.act == "relu"):
+                activation = nn.ReLU(inplace=True)
+            elif(self.act == "relun"):
+                activation = ReLUN(self.act_thres, inplace=True)
+            elif(self.act == "tanh"):
+                activation = nn.Tanh()
+            else:
+                activation = nn.Identity()
+            activation = NormProp(out_channels, activation)
+
+            self.conv_layers[layer_name] = conv
+            self.bn_layers[layer_name] = bn
+            self.acts[layer_name] = activation
+            super().__setattr__(layer_name, conv)
+            super().__setattr__(bn_name, bn)
+            super().__setattr__(act_name, activation)
+
+        self.pool2d = nn.AdaptiveAvgPool2d(self.pool_out_size)
+
+        for idx, hidden_dim in enumerate(self.hidden_list, 0):
+            layer_name = "fc" + str(idx+1)
+            act_name = "fc_act" + str(idx+1)
+            in_channels = self.kernel_list[-1]*self.pool_out_size * \
+                self.pool_out_size if idx == 0 else self.hidden_list[idx-1]
+            out_channels = hidden_dim
+            # fc = nn.Linear(in_channel, out_channel, bias=False)
+            fc = OLinear_Q(in_channels, out_channels, self.in_bits, self.w_bits, False, self.device)
+            if(self.act == "relu"):
+                activation = nn.ReLU(inplace=True)
+            elif(self.act == "relun"):
+                activation = ReLUN(self.act_thres, inplace=True)
+            elif(self.act == "tanh"):
+                activation = nn.Tanh()
+            else:
+                activation = nn.Identity()
+            activation = NormProp(out_channels, activation)
+            self.fc_layers[layer_name] = fc
+            self.acts[layer_name] = activation
+            super().__setattr__(layer_name, fc)
+            super().__setattr__(act_name, activation)
+
+        layer_name = "fc"+str(len(self.hidden_list)+1)
+        fc = OLinear_Q(self.hidden_list[-1], self.n_class, self.in_bits, self.w_bits, False, self.device)
+
+        # fc = nn.Linear(self.hidden_list[-1], self.n_class, bias=False)
+        super().__setattr__(layer_name, fc)
+        self.fc_layers[layer_name] = fc
+        # self.reg = nn.ModuleList(
+        #     list(self.conv_layers.values()) + list(self.fc_layers.values()))
+
+    def reset_parameters(self, initializer=nn.init.kaiming_normal_):
+        # for layer in self.conv_layers:
+        #     # print(self.layers[layer])
+        #     self.conv_layers[layer].reset_parameters()
+        # for layer in self.fc_layers:
+        #     nn.init.kaiming_normal_(self.fc_layers[layer].weight)
+        pass
+
+    def enable_calibration(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].enable_calibration()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].enable_calibration()
+
+    def disable_calibration(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].disable_calibration()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].disable_calibration()
+
+    def static_pre_calibration(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].static_pre_calibration()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].static_pre_calibration()
+
+    def assign_engines(self, out_par=1, image_par=1, phase_noise_std=0, disk_noise_std=0, deterministic=False):
+        self.phase_noise_std = phase_noise_std
+        self.disk_noise_std = disk_noise_std
+        for layer in self.fc_layers:
+            self.fc_layers[layer].assign_engines(out_par, image_par, phase_noise_std, disk_noise_std, deterministic)
+        for layer in self.conv_layers:
+            self.conv_layers[layer].assign_engines(out_par, image_par, phase_noise_std, disk_noise_std, deterministic)
+
+    def deassign_engines(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].deassign_engines()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].deassign_engines()
+
+    def forward(self, x):
+        for idx, layer in enumerate(self.conv_layers, 1):
+            x = self.conv_layers[layer](x)
+            # if(idx == 2):
+            #     print("conv")
+            #     print_stat(x)
+            # x = self.bn_layers[layer](x)
+            # if(idx == 2):
+            #     print("bn")
+            #     print_stat(x)
+            x = self.acts[layer](x, self.conv_layers[layer].weight)
+        n_fc = len(self.fc_layers)
+
+        x = self.pool2d(x)
+
+        x = x.contiguous().view(-1, x.size(1)*x.size(2)*x.size(3))
+
+        for idx, layer in enumerate(self.fc_layers, 1):
+
+            x = self.fc_layers[layer](x)
+
+            if(idx < n_fc):
+                x = self.acts[layer](x, self.fc_layers[layer].weight)
+
+        out = F.log_softmax(x, dim=1)
+        return out
 
 
 if __name__ == "__main__":

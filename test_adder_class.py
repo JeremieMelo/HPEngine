@@ -120,6 +120,7 @@ elif(args.model == "HP_CLASS_CNN2"):
                 act=args.act,
                 act_thres=args.act_thres,
                 mode=args.mode,
+                input_augment=False,
                 device=device).to(device)
 elif(args.model == "HP_CLASS_CNN3"):
     model = HP_CLASS_CNN3(img_height=args.img_height,
@@ -158,7 +159,7 @@ criterion = F.nll_loss
 print(f'[I] Number of parameters: {count_parameters(model)}')
 # summary_model(model, [(batch_size, args.in_channels, args.img_height, args.img_width)])
 
-model_name = f"{args.model}_{args.img_height}x{args.img_width}-{'-'.join(['c'+str(i) for i in args.kernel_list])}-{'-'.join(['f'+str(i) for i in args.hidden_list])}-f{args.n_class}_mode-{args.mode}"
+model_name = f"{args.model}_{args.img_height}x{args.img_width}-{'-'.join(['c'+str(i) for i in args.kernel_list])}-{'-'.join(['f'+str(i) for i in args.hidden_list])}-f{args.n_class}_mode-{args.mode}_wb-{args.weight_bit}_ib-{args.input_bit}"
 checkpoint = f"./checkpoint/{args.checkpoint_dir}/{model_name}_{args.model_comment}.pt"
 lg.info(checkpoint)
 epochs = args.epoch
@@ -262,6 +263,13 @@ if __name__ == "__main__":
 
         for i in range(20):
             model.assign_engines(args.out_par, args.batch_par, args.phase_noise_std, args.disk_noise_std, deterministic=False)
+            if(args.robust_assign):
+                # model.robust_reassign_engines()
+                # model.robust_reassign_engines_fine()
+                model.static_pre_calibration()
+                model.enable_calibration()
+            if(args.mode == "ringonn"):
+                model.assign_ring_noise(args.disk_noise_std, 0.005)
             validate(epoch, lossv, accv)
         lg.info(f"Average loss: {np.mean(lossv)}, Average Acc: {np.mean(accv):.2f}%, Std Acc: {np.std(accv):.3f}")
         accv.append(np.mean(accv))

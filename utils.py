@@ -177,7 +177,12 @@ def load_model(model, path="./checkpoint/model.pt", print_msg=True):
         print_msg (bool, optional): Control of message print. Defaults to True.
     """
     try:
-        model.load_state_dict(torch.load(path,  map_location=lambda storage, location: storage))
+        state_dict = torch.load(path,  map_location=lambda storage, location: storage)
+        cur_state_dict = {key: state_dict[key] for key in model.state_dict()}
+        if(len(state_dict) != len(model.state_dict())):
+            print(f"[W] Warning! Model is not the same as the checkpoint")
+
+        model.load_state_dict(cur_state_dict)
         if(print_msg):
             print(f"[I] Model loaded from {path}")
     except Exception as e:

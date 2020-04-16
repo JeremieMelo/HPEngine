@@ -120,6 +120,7 @@ elif(args.model == "HP_CLASS_CNN2"):
                 act=args.act,
                 act_thres=args.act_thres,
                 mode=args.mode,
+                input_augment=args.lambda_2>0,
                 device=device).to(device)
 elif(args.model == "HP_CLASS_CNN3"):
     model = HP_CLASS_CNN3(img_height=args.img_height,
@@ -144,8 +145,9 @@ optimizer = torch.optim.Adam(
 scheduler = torch.optim.lr_scheduler.ExponentialLR(
     optimizer, gamma=args.lr_gamma)
 # thres_scheduler = ThresholdScheduler(args.phase_2, args.epoch-1, 0.05, 1, mode="tanh")
-phase_noise_scheduler = ThresholdScheduler_tf(0, args.epoch, args.phase_noise_std, args.phase_noise_std/3)
-disk_noise_scheduler = ThresholdScheduler_tf(0, args.epoch, args.disk_noise_std, args.disk_noise_std/3)
+phase_noise_scheduler = ThresholdScheduler_tf(0, args.epoch, args.phase_noise_std, args.phase_noise_std*0.8)
+disk_noise_scheduler = ThresholdScheduler_tf(0, args.epoch, args.disk_noise_std, args.disk_noise_std*0.8)
+alpha_scheduler = ThresholdScheduler_tf(0, 20, 0, 0)
 value_reg = ValueRegister(operator=lambda x, y: x if x >
                           y else y, name="Best Accuracy", show=True)
 value_tracer = ValueTracer(show=False)
@@ -158,7 +160,7 @@ criterion = F.nll_loss
 print(f'[I] Number of parameters: {count_parameters(model)}')
 # summary_model(model, [(batch_size, args.in_channels, args.img_height, args.img_width)])
 
-model_name = f"{args.model}_{args.img_height}x{args.img_width}-{'-'.join(['c'+str(i) for i in args.kernel_list])}-{'-'.join(['f'+str(i) for i in args.hidden_list])}-f{args.n_class}_mode-{args.mode}"
+model_name = f"{args.model}_{args.img_height}x{args.img_width}-{'-'.join(['c'+str(i) for i in args.kernel_list])}-{'-'.join(['f'+str(i) for i in args.hidden_list])}-f{args.n_class}_mode-{args.mode}_wb-{args.weight_bit}_ib-{args.input_bit}"
 checkpoint = f"./checkpoint/{args.checkpoint_dir}/{model_name}_{args.model_comment}.pt"
 lg.info(checkpoint)
 epochs = args.epoch
@@ -182,9 +184,7 @@ def train(phase, epoch, prune_phases=False, log_interval=args.log_interval, trai
         optimizer.zero_grad()
         model.zero_grad()
 
-
-        output = model(data)
-
+        output = model(data, args.lambda_1 > 1e-5)
 
         pred = output.data.max(1)[1]
         correct += pred.eq(target.data).sum().cpu()
@@ -192,6 +192,12 @@ def train(phase, epoch, prune_phases=False, log_interval=args.log_interval, trai
         class_loss = criterion(output, target)
         # class_loss = torch.zeros(1).to(device)
         loss = class_loss
+        if(args.lambda_1 > 1e-5):
+            quant_loss = model.get_act_distrib_loss()
+            loss = loss + args.lambda_1 * quant_loss
+        if(args.lambda_2 > 1e-5):
+            alpha_loss = model.get_alpha_loss()
+            loss = loss + args.lambda_2 * alpha_loss
 
         # Backpropagate
         loss.backward()
@@ -201,10 +207,14 @@ def train(phase, epoch, prune_phases=False, log_interval=args.log_interval, trai
 
         step += 1
         # break
+        # model.clamp_alpha()
 
 
         if batch_idx % log_interval == 0:
-            lg.info('Train Phase: {} Epoch: {} [{:6d}/{:6d} ({:3.0f}%)] Class: {:.4f}'.format(phase, epoch, batch_idx * len(data), len(train_loader.dataset), 100. * batch_idx / len(train_loader), class_loss.data.item()))
+            lg.info('Train Phase: {} Epoch: {} [{:6d}/{:6d} ({:3.0f}%)] Class: {:.4f} Act Loss: {:.4f} Alpha Loss: {:.4f}, a={:.5f}'.format(phase, epoch, batch_idx * len(data), len(train_loader.dataset), 100. * batch_idx / len(train_loader), class_loss.data.item(), quant_loss.data.item() if args.lambda_1 > 1e-5 else -1, alpha_loss.data.item() if args.lambda_2 > 1e-5 else -1, model.get_average_alpha() if args.lambda_2 > 0 else 0))
+
+
+    # model.update_lagrangian_lambda(get_learning_rate(optimizer))
 
 
 
@@ -279,23 +289,34 @@ if __name__ == "__main__":
         #     saver.save_model(model, accv[-1], epoch, checkpoint)
 
         model.disable_calibration()
+        model.init_lagrangian_lambda()
+        model.disable_input_augment()
+        model.disable_trainable_alpha()
+        set_torch_stochastic()
+
         while(epoch < args.epoch):
-            phase_noise_std = phase_noise_scheduler(epoch)
-            disk_noise_std = disk_noise_scheduler(epoch)
-            lg.info(f"phase noise std={phase_noise_std}, disk_noise_std={disk_noise_std}")
+            phase_noise_std = phase_noise_scheduler(0)
+            disk_noise_std = disk_noise_scheduler(0)
+            alpha = alpha_scheduler(epoch)
+            lg.info(f"phase noise std={phase_noise_std}, disk_noise_std={disk_noise_std}, alpha={alpha}")
+            # model.enable_input_augment()
+            # model.set_alpha(alpha)
             train(phase, epoch, log_interval=args.log_interval, train_mode=args.train_mode, phase_noise_std=phase_noise_std, disk_noise_std=disk_noise_std)
             scheduler.step()
             lossv_tmp = []
             accv_tmp = []
-            for i in range(5):
+            for i in range(1):
+                # validate(epoch, [], [])
+                # model.disable_input_augment()
                 model.assign_engines(args.out_par, args.batch_par, args.phase_noise_std, args.disk_noise_std, deterministic=False)
+
                 validate(epoch, lossv_tmp, accv_tmp)
             lg.info(f"Average loss: {np.mean(lossv_tmp)}, Average Accuracy: {np.mean(accv_tmp):.2f}%")
             accv.append(np.mean(accv_tmp))
 
-            epoch += 1
             # break
             saver.save_model(model, accv[-1], epoch, checkpoint)
+            epoch += 1
 
     except KeyboardInterrupt:
         lg.warning("Ctrl-C Stopped")

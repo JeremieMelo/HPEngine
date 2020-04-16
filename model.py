@@ -3048,7 +3048,7 @@ class HP_CLASS_CNN(nn.Module):
 
 
 class HP_CLASS_CNN2(nn.Module):
-    def __init__(self, img_height, img_width, in_channels, n_class, kernel_list=[16], hidden_list=[32], pool_out_size=5, in_bits=32, w_bits=32, act="relu", act_thres=6, mode="oconv", device=torch.device("cuda")):
+    def __init__(self, img_height, img_width, in_channels, n_class, kernel_list=[16], hidden_list=[32], pool_out_size=5, in_bits=32, w_bits=32, act="relu", act_thres=6, mode="oconv", input_augment=False, device=torch.device("cuda")):
         super().__init__()
         self.img_height = img_height
         self.img_width = img_width
@@ -3062,6 +3062,8 @@ class HP_CLASS_CNN2(nn.Module):
         self.act = act
         self.act_thres = act_thres
         self.mode = mode
+        self.input_augment = input_augment
+
         self.device = device
         self.build_layers()
         self.reset_parameters()
@@ -3086,6 +3088,7 @@ class HP_CLASS_CNN2(nn.Module):
                             w_bit=self.w_bits,
                             mode=self.mode,
                             bias=False,
+                            input_augment=self.input_augment,
                             device=self.device)
 
             bn =  nn.BatchNorm2d(out_channels)
@@ -3118,7 +3121,7 @@ class HP_CLASS_CNN2(nn.Module):
                 self.pool_out_size if idx == 0 else self.hidden_list[idx-1]
             out_channel = hidden_dim
             # fc = nn.Linear(in_channel, out_channel, bias=False)
-            fc = OLinear_Q(in_channel, out_channel, self.in_bits, self.w_bits, False, self.device)
+            fc = OLinear_Q(in_channel, out_channel, self.in_bits, self.w_bits, False, self.mode, self.input_augment, self.device)
             if(self.act == "relu"):
                 activation = nn.ReLU(inplace=True)
             elif(self.act == "relun"):
@@ -3133,7 +3136,7 @@ class HP_CLASS_CNN2(nn.Module):
             super().__setattr__(act_name, activation)
 
         layer_name = "fc"+str(len(self.hidden_list)+1)
-        fc = OLinear_Q(self.hidden_list[-1], self.n_class, self.in_bits, self.w_bits, False, self.device)
+        fc = OLinear_Q(self.hidden_list[-1], self.n_class, self.in_bits, self.w_bits, False, self.mode, self.input_augment, self.device)
 
         # fc = nn.Linear(self.hidden_list[-1], self.n_class, bias=False)
         super().__setattr__(layer_name, fc)
@@ -3148,6 +3151,94 @@ class HP_CLASS_CNN2(nn.Module):
         # for layer in self.fc_layers:
         #     nn.init.kaiming_normal_(self.fc_layers[layer].weight)
         pass
+
+    def init_lagrangian_lambda(self):
+        self.lagrangian_lambda = OrderedDict()
+        # for layer in self.conv_layers:
+        #     self.lagrangian_lambda[layer] = torch.ones(self.conv_layers[layer].output_channel).to(self.device)-0.9999
+        for layer in self.conv_layers:
+            self.lagrangian_lambda[layer] = torch.ones(self.conv_layers[layer].input_channel).to(self.device)-0.999
+        for layer in self.fc_layers:
+            self.lagrangian_lambda[layer] = torch.ones(self.fc_layers[layer].input_channel).to(self.device)-0.999
+
+
+    def update_lagrangian_lambda(self, learning_rate):
+        for layer in self.conv_layers:
+            self.lagrangian_lambda[layer] += 2e-2 * self.conv_layers[layer].beta.data.squeeze()
+        for layer in self.fc_layers:
+            self.lagrangian_lambda[layer] += 2e-2 * self.fc_layers[layer].beta.data.squeeze()
+
+    def clamp_alpha(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].beta.data.clamp_(0, 1)
+        for layer in self.fc_layers:
+            self.fc_layers[layer].beta.data.clamp_(0, 1)
+
+    def set_alpha(self, alpha):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].beta.data[...] = alpha
+        for layer in self.fc_layers:
+            self.fc_layers[layer].beta.data[...] = alpha
+
+
+    def get_alpha_loss(self):
+        # loss = None
+        # for layer in self.conv_layers:
+        #     loss = torch.dot(self.lagrangian_lambda[layer], self.conv_layers[layer].beta.squeeze(0).squeeze(-1).squeeze(-1)) if loss is None else loss + torch.dot(self.lagrangian_lambda[layer], self.conv_layers[layer].beta.squeeze(0).squeeze(-1).squeeze(-1))
+        # for layer in self.fc_layers:
+        #     loss = torch.dot(self.lagrangian_lambda[layer], self.fc_layers[layer].beta.squeeze(0)) if loss is None else loss + torch.dot(self.lagrangian_lambda[layer], self.fc_layers[layer].beta.squeeze(0))
+        # if(loss is None):
+        #     return torch.Tensor([0])
+        loss = 0
+        mu = 1e-2
+        for layer in self.conv_layers:
+            beta = self.conv_layers[layer].beta.squeeze(0).squeeze(-1).squeeze(-1)
+            # loss = loss + torch.dot(self.lagrangian_lambda[layer], beta ) + mu*(beta*beta).sum()
+            loss = loss + torch.dot(self.lagrangian_lambda[layer], beta + mu * beta*beta )
+        for layer in self.fc_layers:
+            beta = self.fc_layers[layer].beta.squeeze(0)
+            # loss = loss + torch.dot(self.lagrangian_lambda[layer], beta) + mu * (beta*beta).sum()
+            loss = loss + torch.dot(self.lagrangian_lambda[layer], beta + mu * beta*beta)
+        if(loss is None):
+            return torch.Tensor([0])
+        return loss
+
+    def get_average_alpha(self):
+        alpha = []
+        for layer in self.conv_layers:
+            alpha.append(self.conv_layers[layer].beta.data.squeeze(0).squeeze(-1).squeeze(-1))
+        for layer in self.fc_layers:
+            alpha.append(self.fc_layers[layer].beta.data.squeeze(0))
+        alpha = torch.cat(alpha, dim=0)
+        return alpha.mean().data.item()
+
+    def enable_trainable_alpha(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].beta.requires_grad = True
+        for layer in self.fc_layers:
+            self.fc_layers[layer].beta.requires_grad = True
+
+    def disable_trainable_alpha(self):
+        try:
+            for layer in self.conv_layers:
+                self.conv_layers[layer].beta.requires_grad = False
+            for layer in self.fc_layers:
+                self.fc_layers[layer].beta.requires_grad = False
+        except:
+            pass
+
+
+    def enable_input_augment(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].input_augment = True
+        for layer in self.fc_layers:
+            self.fc_layers[layer].input_augment = True
+
+    def disable_input_augment(self):
+        for layer in self.conv_layers:
+            self.conv_layers[layer].input_augment = False
+        for layer in self.fc_layers:
+            self.fc_layers[layer].input_augment = False
 
     def enable_calibration(self):
         for layer in self.fc_layers:
@@ -3181,16 +3272,63 @@ class HP_CLASS_CNN2(nn.Module):
         for layer in self.conv_layers:
             self.conv_layers[layer].deassign_engines()
 
-    def forward(self, x):
+    def robust_reassign_engines(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].robust_reassign_engines()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].robust_reassign_engines()
+
+    def robust_reassign_engines_fine(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].robust_reassign_engines_fine()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].robust_reassign_engines_fine()
+
+    def assign_ring_noise(self, ring_noise_std=0, ring_crosstalk_perc=0, deterministic=False):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].assign_ring_noise(ring_noise_std, ring_crosstalk_perc, deterministic)
+        for layer in self.conv_layers:
+            self.conv_layers[layer].assign_ring_noise(ring_noise_std, ring_crosstalk_perc, deterministic)
+
+    def init_act_distrib_loss(self):
+        self.act_distrib_loss = 0
+
+    def register_act_distrib_loss(self, act):
+        act = act.clone()
+        k1, k2, k3 = 1, 0.25, 0.25
+        if(act.dim() == 4):
+            act_mean = act.mean(dim=(0,2,3), keepdim=True)
+            act_std = (((act - act_mean)**2).mean(dim=(0,2,3), keepdim=True) + 1e-10).sqrt()
+        elif(act.dim() == 2):
+            act_mean = act.mean(dim=0, keepdim=True)
+            act_std = (((act - act_mean)**2).mean(dim=0, keepdim=True) + 1e-10).sqrt()
+        Ld = ((act_mean.abs() - (k1 * act_std+0.5)).clamp(min=0)**2).mean()
+        Ls = ((k2 * act_std - 1).clamp(min=0)**2).mean()
+        Lm = (torch.min(1 - act_mean - k3*act_std, 1 + act_mean - k3*act_std).clamp(min=0) ** 2).mean()
+        self.act_distrib_loss = self.act_distrib_loss + Ld + Ls + Lm
+
+    def get_act_distrib_loss(self):
+        return self.act_distrib_loss
+        # loss = 0
+        # k1, k2, k3 = 1, 0.25, 0.25
+        # for act in self.activation_record:
+        #     act_mean_abs = act.mean().abs()
+        #     act_std = act.std()
+        #     Ld = (act_mean_abs - k1 * act_std)**2
+        #     Ls = (k2 * act_std - 1)**2
+        #     Lm = (1 - act_mean_abs - k3 * act_std) ** 2
+        #     loss = loss + Ld + Ls + Lm
+        # return loss
+
+    def forward(self, x, act_distrib_loss=False):
+        if(act_distrib_loss):
+            self.init_act_distrib_loss()
         for idx, layer in enumerate(self.conv_layers, 1):
             x = self.conv_layers[layer](x)
-            # if(idx == 2):
-            #     print("conv")
-            #     print_stat(x)
             x = self.bn_layers[layer](x)
-            # if(idx == 2):
-            #     print("bn")
-            #     print_stat(x)
+            if(act_distrib_loss):
+                self.register_act_distrib_loss(x)
+
             x = self.acts[layer](x)
         n_fc = len(self.fc_layers)
 
@@ -3201,11 +3339,14 @@ class HP_CLASS_CNN2(nn.Module):
         for idx, layer in enumerate(self.fc_layers, 1):
 
             x = self.fc_layers[layer](x)
+            if(act_distrib_loss):
+                self.register_act_distrib_loss(x)
 
             if(idx < n_fc):
                 x = self.acts[layer](x)
 
         out = F.log_softmax(x, dim=1)
+
         return out
 
 

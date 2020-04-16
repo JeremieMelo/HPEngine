@@ -118,6 +118,8 @@ argparser.add_arg("--out_par", type=int,
                   default=1, help="output channel parallelism")
 argparser.add_arg("--batch_par", type=int,
                   default=1, help="batch-wise parallelism")
+argparser.add_arg("--robust_assign", type=int,
+                  default=0, help="whether use robustness-aware engine reassignment")
 
 
 args = argparser.parse_args()

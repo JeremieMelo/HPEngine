@@ -1326,6 +1326,7 @@ class OLinear_Q(nn.Module):
         self.input_quantizer = input_quantize_fn(in_bit, self.input_channel, self.mode, self.device)
         self.weight_quantizer = weight_quantize_fn(w_bit, self.mode)
         self.weight = torch.nn.Parameter(torch.zeros(output_channel, input_channel, device=self.device))
+
         # self.mode = "oconv"
         self.phases = torch.cat([torch.zeros(1, 1, input_channel//2, device=self.device) + (np.pi / 2 if self.mode == "oconv_posw" else -np.pi/2), torch.zeros(1, 1, input_channel-input_channel//2, device=self.device) + np.pi / 2],dim=2)
         self.disks = torch.ones(1, 1, input_channel, 2, device=self.device)
@@ -1346,10 +1347,45 @@ class OLinear_Q(nn.Module):
                      "oadder":self.optical_linear,
                      "oconv_posw":self.optical_linear,
                      "conv":self.linear,
-                     "ringonn": self.ring_linear}[self.mode]
+                     "ringonn": self.ring_linear,
+                     "mzionn": self.mzi_linear}[self.mode]
         if(self.mode == "ringonn"):
             self.ring_noise = None
             self.ring_crosstalk_perc = 0
+        if(self.mode == "mzionn"):
+            self.buildUSV()
+
+    def buildUSV(self):
+        self.U = Parameter(torch.Tensor(self.output_channel, self.output_channel).to(
+            self.device).to(torch.float32))
+        self.S = Parameter(torch.Tensor(min(self.output_channel, self.input_channel)).to(
+            self.device).to(torch.float32))
+
+        self.V = Parameter(torch.Tensor(self.input_channel, self.input_channel).to(
+            self.device).to(torch.float32))
+        self.register_parameter("U", self.U)
+        self.register_parameter("V", self.V)
+        self.register_parameter("S", self.S)
+        init.orthogonal_(self.U)
+        init.orthogonal_(self.V)
+        init.ones_(self.S)
+
+    def buildSigma(self, S):
+        M, N = self.output_channel, self.input_channel
+        Sigma = torch.diag(S).to(self.device).to(torch.float32)
+        if(M > N):
+            Sigma = torch.cat(
+                [Sigma, torch.zeros(M - N, N).to(self.device).to(torch.float32)], dim=0)
+        elif(M < N):
+            Sigma = torch.cat(
+                [Sigma, torch.zeros(M, N - M).to(self.device).to(torch.float32)], dim=1)
+
+        return Sigma
+
+    def buildWeight_from_USV(self, U, S, V):
+        Sigma = self.buildSigma(S)
+        W = torch.mm(U, torch.mm(Sigma, V))
+        return W
 
     def reset_parameters(self):
         set_torch_deterministic()
@@ -1556,14 +1592,24 @@ class OLinear_Q(nn.Module):
 
         return F.linear(X*X, W, bias=self.b)
 
+    def mzi_linear(self, X):
+        W = self.buildWeight_from_USV(self.U, self.S, self.V)
+        return F.linear(X, W, bias=self.b)
+
+    def mzi_quantize(self):
+        self.U.data.copy_(quantize_voltage_of_unitary_cpu(self.U, self.w_bit, output_device=self.U.device))
+        self.V.data.copy_(quantize_voltage_of_unitary_cpu(self.V, self.w_bit, output_device=self.V.device))
+
     def forward(self, x):
         input = x.clamp(0,1)
         x = self.input_quantizer(x)
         if(self.input_augment and self.beta.data.max() > 1e-6):
             x = (1-self.beta) * x + self.beta * input
-        weight = self.weight_quantizer(self.weight)
-
-        output = self.func(x, weight)
+        if(self.mode != "mzionn"):
+            weight = self.weight_quantizer(self.weight)
+            output = self.func(x, weight)
+        else:
+            output = self.func(x)
 
         if self.bias:
             output += self.b.unsqueeze(0)
@@ -1620,7 +1666,8 @@ class OAdder2d_Q(nn.Module):
                            "oconv": self.optical_conv2d_function,
                            "oconv_posw": self.optical_conv2d_function,
                            "conv": self.conv2d_function,
-                           "ringonn": self.ring_conv2d_function}[mode]
+                           "ringonn": self.ring_conv2d_function,
+                           "mzionn":self.mzi_conv2d_function}[mode]
         self.reset_parameters()
         self.calibration = False
         self.assigned = False
@@ -1628,6 +1675,8 @@ class OAdder2d_Q(nn.Module):
             self.ring_noise = None
             self.ring_crosstalk_perc = 0
         # self.alpha = Parameter(torch.ones(1, self.output_channel, 1, 1).to(self.device))
+        if(self.mode == "mzionn"):
+            self.buildUSV()
 
     def reset_parameters(self):
         # set_torch_deterministic()
@@ -1640,6 +1689,36 @@ class OAdder2d_Q(nn.Module):
         if self.bias:
             nn.init.uniform_(self.b)
 
+    def buildUSV(self):
+        self.U = Parameter(torch.Tensor(self.output_channel, self.output_channel).to(
+            self.device).to(torch.float32))
+        self.S = Parameter(torch.Tensor(min(self.output_channel, self.input_channel*self.kernel_size*self.kernel_size)).to(self.device).to(torch.float32))
+
+        self.V = Parameter(torch.Tensor(self.input_channel*self.kernel_size*self.kernel_size, self.input_channel*self.kernel_size*self.kernel_size).to(
+            self.device).to(torch.float32))
+        self.register_parameter("U", self.U)
+        self.register_parameter("V", self.V)
+        self.register_parameter("S", self.S)
+        init.orthogonal_(self.U)
+        init.orthogonal_(self.V)
+        init.ones_(self.S)
+
+    def buildSigma(self, S):
+        M, N = self.output_channel, self.input_channel*self.kernel_size*self.kernel_size
+        Sigma = torch.diag(S).to(self.device).to(torch.float32)
+        if(M > N):
+            Sigma = torch.cat(
+                [Sigma, torch.zeros(M - N, N).to(self.device).to(torch.float32)], dim=0)
+        elif(M < N):
+            Sigma = torch.cat(
+                [Sigma, torch.zeros(M, N - M).to(self.device).to(torch.float32)], dim=1)
+
+        return Sigma
+
+    def buildWeight_from_USV(self, U, S, V):
+        Sigma = self.buildSigma(S)
+        W = torch.mm(U, torch.mm(Sigma, V))
+        return W
 
     def assign_engines(self, out_par=1, image_par=1, phase_noise_std=0, disk_noise_std=0, deterministic=False):
         out_par = math.gcd(out_par, self.output_channel)
@@ -1916,23 +1995,23 @@ class OAdder2d_Q(nn.Module):
         return out
 
     def conv2d_function(self, X, W, stride=1, padding=0):
-        W = W * 2 -1
+        if(self.mode != "mzionn"):
+            W = W * 2 -1
         return F.conv2d(X, W, stride=stride, padding=padding)
 
-    def mzi_conv2d_function(self, X, W ,stride=1, padding=0):
+    def mzi_conv2d_function(self, X, stride=1, padding=0):
         n_x = X.size(0)
-        n_filters, d_filter, h_filter, w_filter = W.size()
-        W_col, X_col, h_out, w_out = im2col_2d(W, X, stride, padding)
-        if(self.mzi_noise is not None):
-            pass
+        W = self.buildWeight_from_USV(self.U, self.S, self.V)
+        _, X_col, h_out, w_out = im2col_2d(None, X, stride, padding, (self.output_channel, self.input_channel, self.kernel_size, self.kernel_size))
+        out = W.matmul(X_col)
 
-
-
-        out = W_col.matmul(X_col)**2
-
-        out = out.view(n_filters, h_out, w_out, n_x)
+        out = out.view(self.output_channel, h_out, w_out, n_x)
         out = out.permute(3, 0, 1, 2).contiguous()
         return out
+
+    def mzi_quantize(self):
+        self.U.data.copy_(quantize_voltage_of_unitary_cpu(self.U, self.w_bit, output_device=self.U.device))
+        self.V.data.copy_(quantize_voltage_of_unitary_cpu(self.V, self.w_bit, output_device=self.V.device))
 
     def ring_conv2d_function(self, X, W, stride=1, padding=0):
         # ring can implement posneg weight
@@ -1955,6 +2034,11 @@ class OAdder2d_Q(nn.Module):
         out = out.permute(3, 0, 1, 2).contiguous()
         return out
 
+    def mzi_quantize(self):
+        weight = self.weight.data.double().view(self.output_channel, -1).contiguous().cpu().numpy()
+        weight = quantize_voltage_of_matrix_cpu(weight, self.w_bit, output_device=self.device)
+        self.weight.data.copy_(weight.view_as(self.weight).float())
+
     def forward(self, x):
         # if(self.mode=="oadder" and self.w_bit == 1):
         #     x_mean = x.data.mean(dim=1, keepdim=True)**2 # [bs, 1, h, w]
@@ -1965,10 +2049,11 @@ class OAdder2d_Q(nn.Module):
         x = self.input_quantizer(x)
         if(self.input_augment and self.beta.data.max() > 1e-6):
             x = (1-self.beta) * x + self.beta * input
-        weight = self.weight_quantizer(self.weight)
-
-
-        output = self.adder_func(x, weight, self.stride, self.padding)
+        if(self.mode != "mzionn"):
+            weight = self.weight_quantizer(self.weight)
+            output = self.adder_func(x, weight, self.stride, self.padding)
+        else:
+            output = self.adder_func(x, self.stride, self.padding)
         # if(self.mode=="oadder" and self.w_bit == 1):
         #     x = x * coeff
         # output[self.output_channel // 2:] = output[self.output_channel // 2:] * -1

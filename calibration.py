@@ -94,6 +94,58 @@ def DP_correction_2(phase_noise_std=0.1, disk_noise_std=0.05):
 
     return (res2 - res1).abs().data.item(), (res3 - res1).abs().data.item()
 
+
+def DP_correction_simulation(phase_noise_std=0.1, disk_noise_std=0.05):
+    b = 2
+    # coeff2 = sum(i*j*c for i in range(0, 2**b) for j in range(0, 2**b)) / 2**(2*b)
+    # print(coeff2)
+    N = 4
+
+    x = torch.tensor([0.0667,0.2,0.7333,0.4667]).cuda()
+    w = torch.tensor([0.5333,0.1333,0.7333,0.2667]).cuda()
+
+    phi = torch.tensor([-np.pi/2,-np.pi/2,np.pi/2,np.pi/2]).cuda()
+    print(x)
+    print(w)
+
+    disks = torch.zeros(N,2).cuda()
+    disks.data[:,:] = 0.933254300796991
+    print(phi)
+    print(disks)
+    sin_phi = phi.sin()
+    # beta0 = scistats.gmean(disks[...,0].cpu().numpy())
+    # beta1 = scistats.gmean(disks[...,1].cpu().numpy())
+
+    beta2 = (sin_phi.abs() * (disks[...,0]+disks[...,1])/2).mean() / (disks.mean())
+    # beta3 = scistats.gmean(sin_phi.abs().cpu().numpy())
+    wb = w.clone()
+    wb[w.size(0)//2:] *= -1
+    #sort
+
+
+    res1 = torch.dot(wb, x)
+    rail_0 = (disks[...,0]*(w**2 - 2*w*x*sin_phi + x**2)).sum() / 4
+    rail_1 = (disks[...,1]*(w**2 + 2*w*x*sin_phi + x**2)).sum() / 4
+    print(2*rail_0, 2*rail_1, 2*(rail_0-rail_1))
+    res2 = rail_0 - rail_1
+    res22 = torch.dot(-w*sin_phi*(disks[...,0]+disks[...,1])/2, x) + ((w**2+x**2)*(disks[...,0]-disks[...,1])).sum()/4
+    res3 = (rail_0 / disks[...,0].mean() - rail_1 / disks[...,1].mean())/ beta2
+
+    sin_phi = phi.sin()
+    rail_0 = (disks[...,0]*(w**2 - 2*w*x*sin_phi + x**2)).sum() / 4
+    rail_1 = (disks[...,1]*(w**2 + 2*w*x*sin_phi + x**2)).sum() / 4
+    res4 = rail_0 - rail_1
+    res5 = (rail_0 / disks[...,0].mean() - rail_1 / disks[...,1].mean())/ beta2
+
+    # res4 = (rail_0 / beta0 - rail_1 / beta1)/ beta3
+
+    print("real=", res1.data.item()*2)
+    print("noisy=", res2.data.item()*2)
+    print("noisy=", res22.data.item()*2)
+    print("full_cali=",res3.data.item()*2)
+
+    return (res2 - res1).abs().data.item(), (res3 - res1).abs().data.item()
+
 def test_DP_calibration():
     base_mean = []
     base_std = []
@@ -142,7 +194,8 @@ def EC_correction():
     print(res3)
 
 if __name__ == "__main__":
-    DP_correction_2(0.0001,0.00001)
+    # DP_correction_2(0.0001,0.00001)
+    DP_correction_simulation(0.0001,0.00001)
     # DP_correction()
     # EC_correction()
     # test_DP_calibration()

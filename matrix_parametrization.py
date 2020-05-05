@@ -101,7 +101,7 @@ class RealUnitaryDecomposer(object):
             # solve the equation: u'_1n=0
             phi = np.arctan2(-u2, u1)  # 4 quadrant
 
-        print(phi, u1, u2)
+        # print(phi, u1, u2)
 
         return phi
 
@@ -126,7 +126,7 @@ class RealUnitaryDecomposer(object):
             c, s = np.cos(phi), np.sin(phi)
             row_p, row_q = U[:, p], U[:, q]
             U[:, p], U[:, q] = row_p * c - row_q * s, row_p * s + row_q * c
-            print(U)
+            # print(U)
             # U[:, p], U[:, q] = U[:, p] * c - U[:, q] * s, U[:, p] * s + U[:, q] * c
             # print("rotate:", t.interval)
 
@@ -536,7 +536,7 @@ class RealUnitaryDecomposerBatch(object):
 
         return phi
 
- # @profile(timer=timer)
+    # @profile(timer=timer)
     def decomposeKernel_batch(self, U: np.ndarray, dim, phi_list=None) -> (np.ndarray, np.ndarray):
         '''return U^(N-1); (phi_1,...,phi_N-2); (sigma_1,...,sigma_N-2)'''
         N = U.shape[-1]

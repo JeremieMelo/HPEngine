@@ -1,0 +1,3 @@
+[submodule "pyutils"]
+	path = utils
+	url = https://github.com/JeremieMelo/pyutils

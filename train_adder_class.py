@@ -208,6 +208,10 @@ def train(phase, epoch, prune_phases=False, log_interval=args.log_interval, trai
         step += 1
         # break
         # model.clamp_alpha()
+        if(args.mode == "mzionn"):
+            model.apply_unitary_projection()
+            # if(batch_idx % 50 == 0 and epoch > 5):
+            #     model.mzi_quantize()
 
 
         if batch_idx % log_interval == 0:
@@ -215,6 +219,8 @@ def train(phase, epoch, prune_phases=False, log_interval=args.log_interval, trai
 
 
     # model.update_lagrangian_lambda(get_learning_rate(optimizer))
+    if(args.mode == "mzionn" and epoch > 5):
+        model.mzi_quantize()
 
 
 
@@ -302,6 +308,7 @@ if __name__ == "__main__":
             # model.enable_input_augment()
             # model.set_alpha(alpha)
             train(phase, epoch, log_interval=args.log_interval, train_mode=args.train_mode, phase_noise_std=phase_noise_std, disk_noise_std=disk_noise_std)
+
             scheduler.step()
             lossv_tmp = []
             accv_tmp = []

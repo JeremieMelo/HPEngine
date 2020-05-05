@@ -37,8 +37,10 @@ from tensorflow_model_optimization.python.core.sparsity.keras import \
 from torch.autograd import grad
 from torch.utils import data
 from torchsummary import summary
-
-# from matrix_parametrization import *
+try:
+    from matrix_parametrization import *
+except:
+    print("Failed to import matrix_parametrization module")
 # from rephase2 import *
 
 tf.get_logger().setLevel(logging.ERROR)
@@ -545,9 +547,8 @@ def print_stat(x):
     elif(isinstance(x, np.ndarray)):
         print(f"min = {np.min(x)}, max = {np.max(x)}, mean = {np.mean(x)}, std = {np.std(x)}")
 
-
 ##########################
-#       computation      #
+#       Initializer      #
 ##########################
 
 def quant_kaiming_uniform(w, nbit, beta=1.5):
@@ -579,6 +580,10 @@ def quant_kaiming_uniform_(w, nbit, beta=1.5):
 
     return torch.nn.init.uniform_(w, -L, L), scale
 
+
+##########################
+#       computation      #
+##########################
 
 def shift(v, f=1):
     return torch.cat((f * v[[v.size(0) - 1]], v[:-1]))
@@ -634,20 +639,25 @@ def get_complex_energy(x):
     return x[..., 0] * x[..., 0] + x[..., 1] * x[..., 1]
 
 
-def im2col_2d(W, X=None, stride=1, padding=0):
-    if(X is None):
-        return W.view(W.size(0), -1), None, None, None
-    n_filters, d_filter, h_filter, w_filter = W.size()
-    n_x, d_x, h_x, w_x = X.size()
+def im2col_2d(W=None, X=None, stride=1, padding=0, w_size=None):
+    if(W is not None):
+        W_col = W.view(W.size(0), -1)
+    else:
+        W_col = None
 
-    h_out = (h_x - h_filter + 2 * padding) / stride + 1
-    w_out = (w_x - w_filter + 2 * padding) / stride + 1
+    if(X is not None):
+        n_filters, d_filter, h_filter, w_filter = W.size() if W is not None else w_size
+        n_x, d_x, h_x, w_x = X.size()
 
-    h_out, w_out = int(h_out), int(w_out)
-    X_col = torch.nn.functional.unfold(X.view(
-        1, -1, h_x, w_x), h_filter, dilation=1, padding=padding, stride=stride).view(n_x, -1, h_out*w_out)
-    X_col = X_col.permute(1, 2, 0).contiguous().view(X_col.size(1), -1)
-    W_col = W.view(n_filters, -1) # [out_c, in_c*kernel_size*kernel_size]
+        h_out = (h_x - h_filter + 2 * padding) / stride + 1
+        w_out = (w_x - w_filter + 2 * padding) / stride + 1
+
+        h_out, w_out = int(h_out), int(w_out)
+        X_col = torch.nn.functional.unfold(X.view(
+            1, -1, h_x, w_x), h_filter, dilation=1, padding=padding, stride=stride).view(n_x, -1, h_out*w_out)
+        X_col = X_col.permute(1, 2, 0).contiguous().view(X_col.size(1), -1)
+    else:
+        X_col, h_out, w_out = None, None, None
 
     return W_col, X_col, h_out, w_out
 
@@ -1168,11 +1178,11 @@ def quantize_voltage_of_matrix_cpu(W, v_bit, v_pi=4.36, v_max=10.8, voltage_mask
         # print("before Q:", v_list_U)
         # print("after Q:", v_list_U_q)
         # print("backup:", voltage_backup_U)
-        print("Mask Is All True")
-        print("sigma", Sigma)
-        print("delta:", delta_list_U)
-        print("v_list_U_q:", v_list_U_q)
-        print("v_backup_U", voltage_backup_U)
+        # print("Mask Is All True")
+        # print("sigma", Sigma)
+        # print("delta:", delta_list_U)
+        # print("v_list_U_q:", v_list_U_q)
+        # print("v_backup_U", voltage_backup_U)
 
     # print("v_list_U_q:", v_list_U_q)
     # print("v_backup_U:", voltage_backup_U)
@@ -1189,13 +1199,13 @@ def quantize_voltage_of_matrix_cpu(W, v_bit, v_pi=4.36, v_max=10.8, voltage_mask
 
     W_recon = torch.from_numpy(W_recon).to(torch.float32).to(output_device)
 
-    res = check_equal_tensor(W, W_recon)
-    print("[I] checkEqual: ", res)
-    # print("S:", Sigma)
-    # print("delta_U:", delta_list_U)
-    # print("delta_V:", delta_list_V)
-    print("W:", W)
-    print("W_rec:", W_recon)
+    # res = check_equal_tensor(W, W_recon)
+    # print("[I] checkEqual: ", res)
+    # # print("S:", Sigma)
+    # # print("delta_U:", delta_list_U)
+    # # print("delta_V:", delta_list_V)
+    # print("W:", W)
+    # print("W_rec:", W_recon)
 
     # bin=2**v_bit
     # plt.figure()
@@ -2246,6 +2256,8 @@ def butterfly_permutation(num_layers: int):
     return np.vstack((ordered_idx.astype(np.int32),
                       permuted_idx[1:].astype(np.int32),
                       ordered_idx.astype(np.int32)))
+
+
 
 if __name__ == "__main__":
 

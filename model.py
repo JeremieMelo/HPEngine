@@ -3161,7 +3161,6 @@ class HP_CLASS_CNN2(nn.Module):
         for layer in self.fc_layers:
             self.lagrangian_lambda[layer] = torch.ones(self.fc_layers[layer].input_channel).to(self.device)-0.999
 
-
     def update_lagrangian_lambda(self, learning_rate):
         for layer in self.conv_layers:
             self.lagrangian_lambda[layer] += 2e-2 * self.conv_layers[layer].beta.data.squeeze()
@@ -3179,7 +3178,6 @@ class HP_CLASS_CNN2(nn.Module):
             self.conv_layers[layer].beta.data[...] = alpha
         for layer in self.fc_layers:
             self.fc_layers[layer].beta.data[...] = alpha
-
 
     def get_alpha_loss(self):
         # loss = None
@@ -3226,7 +3224,6 @@ class HP_CLASS_CNN2(nn.Module):
                 self.fc_layers[layer].beta.requires_grad = False
         except:
             pass
-
 
     def enable_input_augment(self):
         for layer in self.conv_layers:
@@ -3289,6 +3286,24 @@ class HP_CLASS_CNN2(nn.Module):
             self.fc_layers[layer].assign_ring_noise(ring_noise_std, ring_crosstalk_perc, deterministic)
         for layer in self.conv_layers:
             self.conv_layers[layer].assign_ring_noise(ring_noise_std, ring_crosstalk_perc, deterministic)
+
+    def mzi_quantize(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].mzi_quantize()
+        for layer in self.conv_layers:
+            self.conv_layers[layer].mzi_quantize()
+
+    def apply_unitary_projection(self):
+        for layer in self.fc_layers:
+            self.fc_layers[layer].U.data.copy_(torch.from_numpy(projection_matrix_to_unitary_cpu(
+                self.fc_layers[layer].U.data.detach().cpu().numpy())).to(self.device))
+            self.fc_layers[layer].V.data.copy_(torch.from_numpy(projection_matrix_to_unitary_cpu(
+                self.fc_layers[layer].V.data.detach().cpu().numpy())).to(self.device))
+        for layer in self.conv_layers:
+            self.conv_layers[layer].U.data.copy_(torch.from_numpy(projection_matrix_to_unitary_cpu(
+                self.conv_layers[layer].U.data.detach().cpu().numpy())).to(self.device))
+            self.conv_layers[layer].V.data.copy_(torch.from_numpy(projection_matrix_to_unitary_cpu(
+                self.conv_layers[layer].V.data.detach().cpu().numpy())).to(self.device))
 
     def init_act_distrib_loss(self):
         self.act_distrib_loss = 0
